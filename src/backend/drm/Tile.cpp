@@ -61,6 +61,28 @@ static bool sameTiming(const drmModeModeInfo& a, const drmModeModeInfo& b) {
         a.vdisplay == b.vdisplay && a.vsync_start == b.vsync_start && a.vsync_end == b.vsync_end && a.vtotal == b.vtotal && a.vscan == b.vscan && a.flags == b.flags;
 }
 
+std::vector<SDRMFormat> Aquamarine::intersectDRMTileFormats(std::span<const std::vector<SDRMFormat>> heads) {
+    std::vector<SDRMFormat> result;
+    if (heads.empty())
+        return result;
+    for (const auto& first : heads.front()) {
+        for (const auto modifier : first.modifiers) {
+            const bool common = std::ranges::all_of(heads.subspan(1), [&](const auto& formats) {
+                return std::ranges::any_of(
+                    formats, [&](const auto& format) { return format.drmFormat == first.drmFormat && std::ranges::find(format.modifiers, modifier) != format.modifiers.end(); });
+            });
+            if (!common)
+                continue;
+            auto format = std::ranges::find(result, first.drmFormat, &SDRMFormat::drmFormat);
+            if (format == result.end()) {
+                result.push_back({.drmFormat = first.drmFormat, .modifiers = {modifier}});
+            } else if (std::ranges::find(format->modifiers, modifier) == format->modifiers.end())
+                format->modifiers.push_back(modifier);
+        }
+    }
+    return result;
+}
+
 static bool nativeTiming(const drmModeModeInfo& mode, const SDRMConnector::STileInfo& tile) {
     return mode.clock && mode.hdisplay == tile.tileHSize && mode.vdisplay == tile.tileVSize && mode.hdisplay <= mode.hsync_start && mode.hsync_start <= mode.hsync_end &&
         mode.hsync_end <= mode.htotal && mode.vdisplay <= mode.vsync_start && mode.vsync_start <= mode.vsync_end && mode.vsync_end <= mode.vtotal &&

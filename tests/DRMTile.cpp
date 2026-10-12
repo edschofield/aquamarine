@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <string>
+#include <drm_fourcc.h>
 
 using namespace Aquamarine;
 
@@ -162,5 +163,33 @@ int main() {
     EXPECT(plan->width, 2560U);
     EXPECT(plan->height, 5760U);
     EXPECT(plan->placements[1].y, 2880U);
+
+    // A layout usable on just one physical head must not escape to the
+    // compositor's allocator. INVALID is implicit support, not a wildcard.
+    const uint64_t                         tiledA = 0x0100000000000001, tiledB = 0x0100000000000002;
+    std::array<std::vector<SDRMFormat>, 2> formats{std::vector<SDRMFormat>{{DRM_FORMAT_XRGB8888, {tiledA, tiledB, DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID}},
+                                                                           {DRM_FORMAT_ARGB8888, {tiledA}},
+                                                                           {DRM_FORMAT_XRGB8888, {tiledB}}},
+                                                   std::vector<SDRMFormat>{{DRM_FORMAT_XRGB8888, {DRM_FORMAT_MOD_LINEAR, tiledB, tiledB}}}};
+    auto                                   common = intersectDRMTileFormats(formats);
+    EXPECT(common.size(), 1U);
+    if (common.size() != 1)
+        return 1;
+    EXPECT(common[0].drmFormat, DRM_FORMAT_XRGB8888);
+    EXPECT(common[0].modifiers.size(), 2U);
+    EXPECT(common[0].modifiers == std::vector<uint64_t>({tiledB, DRM_FORMAT_MOD_LINEAR}), true);
+    formats[1][0].modifiers = {DRM_FORMAT_MOD_INVALID};
+    common                  = intersectDRMTileFormats(formats);
+    EXPECT(common.size() == 1 && common[0].modifiers == std::vector<uint64_t>({DRM_FORMAT_MOD_INVALID}), true);
+    formats[1].clear();
+    EXPECT(intersectDRMTileFormats(formats).empty(), true);
+    EXPECT(intersectDRMTileFormats({}).empty(), true);
+    formats[1] = {{DRM_FORMAT_ARGB8888, {DRM_FORMAT_MOD_LINEAR}}};
+    EXPECT(intersectDRMTileFormats(formats).empty(), true);
+    const std::array<std::vector<SDRMFormat>, 3> threeHeads{std::vector<SDRMFormat>{{DRM_FORMAT_XRGB8888, {tiledA, tiledB}}},
+                                                            std::vector<SDRMFormat>{{DRM_FORMAT_XRGB8888, {tiledB, tiledA}}},
+                                                            std::vector<SDRMFormat>{{DRM_FORMAT_XRGB8888, {tiledB}}}};
+    common = intersectDRMTileFormats(threeHeads);
+    EXPECT(common.size() == 1 && common[0].modifiers == std::vector<uint64_t>({tiledB}), true);
     return ret;
 }
