@@ -58,7 +58,19 @@ int main() {
     EXPECT(parseDRMTile("1:0:2:1:0:0:2560:2880").has_value(), true);
 
     auto members = imac();
-    auto plan    = planDRMTiles(members);
+    EXPECT(hasDRMTileAggregateMode(members[0].tile, members[0].modes), false);
+    auto full     = nativeMode();
+    full.hdisplay = 5120;
+    EXPECT(hasDRMTileAggregateMode(members[0].tile, std::array{full}), true);
+    auto wide     = full;
+    wide.vdisplay = 1440;
+    auto tall     = nativeMode();
+    tall.hdisplay = 3840;
+    EXPECT(hasDRMTileAggregateMode(members[0].tile, std::array{wide, tall}), false);
+    full.flags |= DRM_MODE_FLAG_INTERLACE;
+    EXPECT(hasDRMTileAggregateMode(members[0].tile, std::array{full}), false);
+    EXPECT(hasDRMTileAggregateMode(members[0].tile, {}), false);
+    auto plan = planDRMTiles(members);
     EXPECT(plan.has_value(), true);
     if (!plan)
         return 1;

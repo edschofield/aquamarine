@@ -8,6 +8,7 @@
 namespace Aquamarine {
     // Internal helpers. TILE group IDs are only meaningful within one DRM device.
     std::optional<SDRMConnector::STileInfo> parseDRMTile(std::string_view blob);
+    bool                                    hasDRMTileAggregateMode(const SDRMConnector::STileInfo& tile, std::span<const drmModeModeInfo> modes);
 
     struct SDRMTileMember {
         uint64_t                     device    = 0;

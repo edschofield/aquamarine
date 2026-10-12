@@ -48,6 +48,14 @@ std::optional<SDRMConnector::STileInfo> Aquamarine::parseDRMTile(std::string_vie
     return tile;
 }
 
+bool Aquamarine::hasDRMTileAggregateMode(const SDRMConnector::STileInfo& tile, std::span<const drmModeModeInfo> modes) {
+    if (!validTile(tile))
+        return false;
+    const auto width  = uint64_t(tile.numHTile) * tile.tileHSize;
+    const auto height = uint64_t(tile.numVTile) * tile.tileVSize;
+    return std::ranges::any_of(modes, [width, height](const auto& mode) { return !(mode.flags & DRM_MODE_FLAG_INTERLACE) && mode.hdisplay >= width && mode.vdisplay >= height; });
+}
+
 static bool sameTiming(const drmModeModeInfo& a, const drmModeModeInfo& b) {
     return a.clock == b.clock && a.hdisplay == b.hdisplay && a.hsync_start == b.hsync_start && a.hsync_end == b.hsync_end && a.htotal == b.htotal && a.hskew == b.hskew &&
         a.vdisplay == b.vdisplay && a.vsync_start == b.vsync_start && a.vsync_end == b.vsync_end && a.vtotal == b.vtotal && a.vscan == b.vscan && a.flags == b.flags;

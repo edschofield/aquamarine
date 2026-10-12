@@ -1183,7 +1183,14 @@ void Aquamarine::CDRMBackend::markRedundantTiles() {
         // meaning the driver handles tiling internally
         SP<SDRMConnector> fullResConn;
         for (const auto& conn : members) {
-            if (conn->maxMode.x >= fullWidth && conn->maxMode.y >= fullHeight) {
+            // Width and height must belong to the same usable mode. Independent
+            // maxima can invent a full-panel mode that the connector never had.
+            auto drmConn = drmModeGetConnectorCurrent(gpu->fd, conn->id);
+            if (!drmConn)
+                continue;
+            const bool fullMode = drmConn->count_modes > 0 && hasDRMTileAggregateMode(ti, {drmConn->modes, static_cast<size_t>(drmConn->count_modes)});
+            drmModeFreeConnector(drmConn);
+            if (fullMode) {
                 fullResConn = conn;
                 break;
             }
