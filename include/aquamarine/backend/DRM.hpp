@@ -16,6 +16,7 @@ namespace Aquamarine {
     class CDRMBackend;
     class CDRMFB;
     class CDRMOutput;
+    struct SDRMTileGroup;
     struct SDRMConnector;
     class CDRMRenderer;
     class CDRMDumbAllocator;
@@ -266,6 +267,13 @@ namespace Aquamarine {
         CDRMOutput(const std::string& name_, Hyprutils::Memory::CWeakPointer<CDRMBackend> backend_, Hyprutils::Memory::CSharedPointer<SDRMConnector> connector_);
 
         bool commitState(bool onlyTest = false);
+        bool                           commitTiled(bool onlyTest = false);
+        void                           invalidateTiledFrame();
+        void                           recoverTiledFrame();
+        void                           tiledPageFlip(uintptr_t token, uint32_t crtc, unsigned seq, unsigned sec, unsigned usec);
+        bool                           disconnectTiled();
+        std::shared_ptr<SDRMTileGroup> tiled;
+        bool                           announced = false;
         bool prepareAsyncCommitData(const COutputState::CSnapshot& snapshot, SDRMConnectorCommitData& data, Hyprutils::OS::CFileDescriptor& mgpuFence, bool& mgpuAcquired,
                                     bool& requiresSync);
 
@@ -305,6 +313,7 @@ namespace Aquamarine {
         DRMFBList                                 retiredFBs;
         Hyprutils::Math::CRegion                  damage;
         drmModeModeInfo                           modeInfo;
+        std::optional<Hyprutils::Math::CBox>      primarySource;
         std::optional<Hyprutils::Math::Mat3x3>    ctm;
         std::optional<hdr_output_metadata>        hdrMetadata;
 
@@ -383,6 +392,8 @@ namespace Aquamarine {
 
         STileInfo                                      tileInfo;
         bool                                           tilingRedundant = false;
+        Hyprutils::Memory::CWeakPointer<CDRMOutput>    tiledOwner;
+        std::optional<Hyprutils::Math::CBox>           tiledSource;
         Hyprutils::Math::Vector2D                      maxMode;
 
         bool                                           cursorEnabled = false;
@@ -511,6 +522,7 @@ namespace Aquamarine {
         void     recheckOutputs();
         void     recheckCRTCs();
         void     markRedundantTiles();
+        void     configureTiledOutputs();
         void     buildGlFormats(const std::vector<SGLFormat>& fmts);
         bool     initCommitThread();
         void     stopCommitThread();

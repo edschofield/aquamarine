@@ -10,6 +10,7 @@ namespace Aquamarine {
         CDRMAtomicImpl(Hyprutils::Memory::CSharedPointer<CDRMBackend> backend_);
         virtual bool                                         commit(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data);
         virtual bool                                         reset();
+        bool commitGroup(std::vector<std::pair<Hyprutils::Memory::CSharedPointer<SDRMConnector>, SDRMConnectorCommitData>>& heads, uint32_t flags, uintptr_t token);
         virtual bool                                         moveCursor(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, bool skipSchedule = false);
 
         Hyprutils::Memory::CUniquePointer<CDRMAtomicRequest> prepareAsync(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data,
@@ -44,7 +45,7 @@ namespace Aquamarine {
         bool         addRaw(uint32_t id, uint32_t prop, uint64_t val) noexcept;
         SAsyncResult submitAsync(int drmFD, uint32_t flags, uint64_t commitID) noexcept;
         void         planeProps(Hyprutils::Memory::CSharedPointer<SDRMPlane> plane, Hyprutils::Memory::CSharedPointer<CDRMFB> fb, uint32_t crtc, Hyprutils::Math::Vector2D pos,
-                                eOutputColorRange colorRange = AQ_OUTPUT_COLOR_RANGE_AUTO);
+                                eOutputColorRange colorRange = AQ_OUTPUT_COLOR_RANGE_AUTO, std::optional<Hyprutils::Math::CBox> source = std::nullopt);
         void         planePropsPos(Hyprutils::Memory::CSharedPointer<SDRMPlane> plane, Hyprutils::Math::Vector2D pos);
 
         void         rollback(SDRMConnectorCommitData& data);

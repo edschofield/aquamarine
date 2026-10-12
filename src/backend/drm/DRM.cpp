@@ -39,6 +39,7 @@ extern "C" {
 #include "Renderer.hpp"
 #include "OutputTiming.hpp"
 #include "DRMTile.hpp"
+#include "DRMTileGroup.hpp"
 #include "AsyncCommit.hpp"
 
 #include <hyprutils/utils/ScopeGuard.hpp>
@@ -626,6 +627,16 @@ void Aquamarine::CDRMBackend::restoreAfterVT() {
         if (!c->crtc || !c->output)
             continue;
 
+        if (c->tiledOwner) {
+            if (c->tiledOwner != c->output)
+                continue;
+            c->output->tiled->needsModeset = true;
+            if (!c->output->commitTiled())
+                c->output->events.state.emit(IOutput::SStateEvent{});
+            c->output->scheduleFrame(IOutput::AQ_SCHEDULE_NEW_CONNECTOR);
+            continue;
+        }
+
         auto&                   STATE = c->output->state->state();
 
         SDRMConnectorCommitData data = {
@@ -978,7 +989,7 @@ void Aquamarine::CDRMBackend::recheckCRTCs() {
         }
 
         // disabled outputs release their CRTCs so active outputs get priority
-        if (c->crtc && c->status == DRM_MODE_CONNECTED && c->output && !c->output->enabledState) {
+        if (!c->tiledOwner && c->crtc && c->status == DRM_MODE_CONNECTED && c->output && !c->output->enabledState) {
             backend->log(AQ_LOG_DEBUG, std::format("drm: {} is disabled, releasing crtc {}", c->szName, c->crtc->id));
             c->setCRTC(nullptr);
         }
@@ -1253,6 +1264,16 @@ void Aquamarine::CDRMBackend::recheckOutputs() {
         }
     }
 
+    configureTiledOutputs();
+    if (backend->ready) {
+        for (const auto& head : connectors) {
+            if (!head->output || head->output->announced || (head->tiledOwner && head->tiledOwner != head->output))
+                continue;
+            head->output->announced = true;
+            backend->events.newOutput.emit(SP<IOutput>(head->output));
+            head->output->scheduleFrame(IOutput::AQ_SCHEDULE_NEW_CONNECTOR);
+        }
+    }
     if (!updateSecondaryRendererState())
         backend->log(AQ_LOG_ERROR, std::format("drm: Failed to update renderer state for {}", gpu->path));
 }
@@ -1376,6 +1397,15 @@ std::vector<Hyprutils::Memory::CSharedPointer<SPollFD>> Aquamarine::CDRMBackend:
     std::vector<SP<SPollFD>> fds = {makeShared<SPollFD>(gpu->fd, [this]() { dispatchEvents(); })};
     if (commitThread)
         fds.emplace_back(makeShared<SPollFD>(commitThread->completionFD(), [this]() { dispatchCommitResults(); }));
+    for (const auto& head : connectors) {
+        if (!head->output || !head->output->tiled)
+            continue;
+        auto owner = head->output->self;
+        fds.emplace_back(makeShared<SPollFD>(head->output->tiled->watchdog.get(), [owner]() {
+            if (const auto output = owner.lock())
+                output->recoverTiledFrame();
+        }));
+    }
     return fds;
 }
 
@@ -1464,6 +1494,11 @@ void Aquamarine::CDRMBackend::handlePageFlip(uintptr_t flipID, unsigned int seq,
 
     if (!CONNECTOR) {
         log(AQ_LOG_DEBUG, "drm: Ignoring a pf event whose connector is gone");
+        return;
+    }
+
+    if (const auto owner = CONNECTOR->tiledOwner.lock()) {
+        owner->tiledPageFlip(flipID, crtcID, seq, sec, usec);
         return;
     }
 
@@ -1574,7 +1609,10 @@ void Aquamarine::CDRMBackend::onReady() {
         c->output->swapchain->reconfigure(SSwapchainOptions{.length = 0, .scanout = true, .multigpu = !!primary, .scanoutOutput = c->output}); // mark the swapchain for scanout
         c->output->needsFrame = true;
 
-        backend->events.newOutput.emit(SP<IOutput>(c->output));
+        if (!c->tiledOwner || c->tiledOwner == c->output) {
+            c->output->announced = true;
+            backend->events.newOutput.emit(SP<IOutput>(c->output));
+        }
     }
 
     if (!updateSecondaryRendererState()) {
@@ -1986,7 +2024,11 @@ void Aquamarine::SDRMConnector::recheckCRTCProps() {
                           std::format("drm: connector {} crtc is {} of vrr: props.vrr_capable -> {}, crtc->props.vrr_enabled -> {}", szName, (canDoVrr ? "capable" : "incapable"),
                                       props.values.vrr_capable, crtc->props.values.vrr_enabled));
 
-    output->supportsExplicit = backend->drmProps.supportsTimelines && crtc->props.values.out_fence_ptr && crtc->primary->props.values.in_fence_fd;
+    output->supportsExplicit = !tiledOwner && backend->drmProps.supportsTimelines && crtc->props.values.out_fence_ptr && crtc->primary->props.values.in_fence_fd;
+    if (tiledOwner) {
+        canDoVrr           = false;
+        output->vrrCapable = false;
+    }
 
     backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Explicit sync {}", output->supportsExplicit ? "supported" : "unsupported"));
 
@@ -2118,11 +2160,15 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
     output->swapchain   = CSwapchain::create(backend->backend->primaryAllocator, primaryBackend.lock());
     output->swapchain->reconfigure(SSwapchainOptions{.length = 0, .scanout = true, .multigpu = !!backend->primary, .scanoutOutput = output}); // mark the swapchain for scanout
     output->needsFrame = true;
-    backend->backend->events.newOutput.emit(SP<IOutput>(output));
-    output->scheduleFrame(IOutput::AQ_SCHEDULE_NEW_CONNECTOR);
+    // recheckOutputs publishes after complete tiled groups have been formed.
 }
 
 void Aquamarine::SDRMConnector::disconnect() {
+    if (const auto owner = tiledOwner.lock()) {
+        if (!owner->disconnectTiled())
+            backend->log(AQ_LOG_WARNING, "drm: Deferring tiled teardown until the complete group can be disabled");
+        return;
+    }
     if (!output) {
         if (backend && backend->backend)
             backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Not disconnecting connector {} because it's already disconnected", szName));
@@ -2155,7 +2201,8 @@ void Aquamarine::SDRMConnector::disconnect() {
     status = DRM_MODE_DISCONNECTED;
     releaseFBReferences();
 
-    output->events.destroy.emit();
+    if (output->announced)
+        output->events.destroy.emit();
     output.reset();
 }
 
@@ -2266,6 +2313,10 @@ void Aquamarine::SDRMConnector::applyCommit(SDRMConnectorCommitData& data) {
 }
 
 void Aquamarine::SDRMConnector::invalidateFrame() {
+    if (const auto owner = tiledOwner.lock()) {
+        owner->invalidateTiledFrame();
+        return;
+    }
     sched.invalidate();
 
     if (crtc && crtc->pendingFlip.connector == self) {
@@ -2348,6 +2399,10 @@ void Aquamarine::CDRMOutput::releaseMgpuResources() {
 }
 
 bool Aquamarine::CDRMOutput::commit() {
+    if (tiled)
+        return commitTiled();
+    if (connector->tiledOwner)
+        return false;
     if (!connector->crtc)
         return commitState();
 
@@ -2363,6 +2418,10 @@ bool Aquamarine::CDRMOutput::commit() {
 }
 
 bool Aquamarine::CDRMOutput::test() {
+    if (tiled)
+        return commitTiled(true);
+    if (connector->tiledOwner)
+        return false;
     if (!connector->crtc)
         return commitState(true);
 
@@ -2843,6 +2902,8 @@ SP<IBackendImplementation> Aquamarine::CDRMOutput::getBackend() {
 }
 
 bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotspot) {
+    if (connector->tiledOwner)
+        return !buffer;
     if (!connector->crtc)
         return false;
 
@@ -2941,6 +3002,8 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
 }
 
 void Aquamarine::CDRMOutput::moveCursor(const Vector2D& coord, bool skipSchedule) {
+    if (connector->tiledOwner)
+        return;
     cursorPos = coord;
     if (cursorMailbox)
         cursorMailbox->store(coord);
@@ -2999,6 +3062,8 @@ Vector2D Aquamarine::CDRMOutput::cursorPlaneSize() {
 }
 
 bool Aquamarine::CDRMOutput::hasCursorPlane() const {
+    if (connector->tiledOwner)
+        return false;
     return connector->status == DRM_MODE_CONNECTED && connector->crtc && connector->crtc->cursor && !connector->crtc->cursor->formats.empty();
 }
 
@@ -3047,6 +3112,8 @@ std::optional<std::chrono::steady_clock::time_point> Aquamarine::CDRMOutput::nex
 }
 
 uint32_t Aquamarine::CDRMOutput::commitCapabilities() const {
+    if (connector->tiledOwner)
+        return 0;
     if (!backend || !backend->commitThread || !backend->atomic)
         return 0;
 
@@ -3183,6 +3250,8 @@ Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const
 }
 
 size_t Aquamarine::CDRMOutput::getGammaSize() {
+    if (connector->tiledOwner)
+        return 0;
     if (!backend->atomic) {
         backend->log(AQ_LOG_ERROR, "No support for gamma on the legacy iface");
         return 0;
@@ -3203,6 +3272,8 @@ size_t Aquamarine::CDRMOutput::getGammaSize() {
 }
 
 size_t Aquamarine::CDRMOutput::getDeGammaSize() {
+    if (connector->tiledOwner)
+        return 0;
     if (!backend->atomic) {
         backend->log(AQ_LOG_ERROR, "No support for gamma on the legacy iface");
         return 0;
@@ -3223,6 +3294,18 @@ size_t Aquamarine::CDRMOutput::getDeGammaSize() {
 }
 
 std::vector<SDRMFormat> Aquamarine::CDRMOutput::getRenderFormats() {
+    if (tiled) {
+        std::vector<std::vector<SDRMFormat>> formats;
+        for (const auto& head : tiled->heads) {
+            if (!head->crtc || !head->crtc->primary)
+                return {};
+            formats.push_back(head->crtc->primary->formats);
+        }
+        auto common = intersectDRMTileFormats(formats);
+        // Initial group path is SDR, with formats verified by the iMac probe.
+        std::erase_if(common, [](const auto& f) { return f.drmFormat != DRM_FORMAT_XRGB8888 && f.drmFormat != DRM_FORMAT_ARGB8888; });
+        return common;
+    }
     if (!connector->crtc || !connector->crtc->primary || connector->crtc->primary->formats.empty()) {
         backend->log(AQ_LOG_ERROR, "Can't get formats: no crtc");
         return {};
@@ -3510,6 +3593,10 @@ SP<CDRMLease> Aquamarine::CDRMLease::create(std::vector<SP<IOutput>> outputs) {
 
     for (auto const& o : outputs) {
         auto drmo = ((CDRMOutput*)o.get())->self.lock();
+        if (drmo->connector->tiledOwner) {
+            backend->log(AQ_LOG_ERROR, "drm lease: tiled output leases are not supported");
+            return nullptr;
+        }
         backend->log(AQ_LOG_DEBUG, std::format("drm lease: output {}, connector {}", drmo->name, drmo->connector->id));
 
         // FIXME: do we have to alloc a crtc here?

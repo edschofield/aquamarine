@@ -121,7 +121,7 @@ bool Aquamarine::CDRMAtomicRequest::restateConnectors(SP<SDRMConnector> self) {
             // head we are restating rather than ours.
             const auto saved = conn;
             conn             = c;
-            planeProps(c->crtc->primary, c->crtc->primary->front, c->crtc->id, {}, c->atomic.colorRange);
+            planeProps(c->crtc->primary, c->crtc->primary->front, c->crtc->id, {}, c->atomic.colorRange, c->tiledSource);
             conn = saved;
         }
 
@@ -139,6 +139,7 @@ void Aquamarine::CDRMAtomicRequest::add(uint32_t id, uint32_t prop, uint64_t val
 
     if (id == 0 || prop == 0) {
         backend->log(AQ_LOG_ERROR, "atomic drm request: failed to add prop: id / prop == 0");
+        failed = true;
         return;
     }
 
@@ -167,7 +168,7 @@ CDRMAtomicRequest::SAsyncResult Aquamarine::CDRMAtomicRequest::submitAsync(int d
 }
 
 void Aquamarine::CDRMAtomicRequest::planeProps(Hyprutils::Memory::CSharedPointer<SDRMPlane> plane, Hyprutils::Memory::CSharedPointer<CDRMFB> fb, uint32_t crtc,
-                                               Hyprutils::Math::Vector2D pos, eOutputColorRange colorRange) {
+                                               Hyprutils::Math::Vector2D pos, eOutputColorRange colorRange, std::optional<CBox> source) {
 
     if (failed)
         return;
@@ -187,13 +188,18 @@ void Aquamarine::CDRMAtomicRequest::planeProps(Hyprutils::Memory::CSharedPointer
                                    plane->props.values.src_y, plane->props.values.src_w, plane->props.values.src_h, plane->props.values.crtc_w, plane->props.values.crtc_h,
                                    plane->props.values.fb_id, plane->props.values.crtc_id)));
 
-    // src_ are 16.16 fixed point (lol)
-    add(plane->id, plane->props.values.src_x, 0);
-    add(plane->id, plane->props.values.src_y, 0);
-    add(plane->id, plane->props.values.src_w, ((uint64_t)fb->buffer->size.x) << 16);
-    add(plane->id, plane->props.values.src_h, ((uint64_t)fb->buffer->size.y) << 16);
-    add(plane->id, plane->props.values.crtc_w, (uint32_t)fb->buffer->size.x);
-    add(plane->id, plane->props.values.crtc_h, (uint32_t)fb->buffer->size.y);
+    const CBox src = source.value_or(CBox{{}, fb->buffer->size});
+    if (src.x < 0 || src.y < 0 || src.w <= 0 || src.h <= 0 || src.x + src.w > fb->buffer->size.x || src.y + src.h > fb->buffer->size.y || src.x + src.w > 65535 ||
+        src.y + src.h > 65535) {
+        failed = true;
+        return;
+    }
+    add(plane->id, plane->props.values.src_x, uint64_t(src.x) << 16);
+    add(plane->id, plane->props.values.src_y, uint64_t(src.y) << 16);
+    add(plane->id, plane->props.values.src_w, uint64_t(src.w) << 16);
+    add(plane->id, plane->props.values.src_h, uint64_t(src.h) << 16);
+    add(plane->id, plane->props.values.crtc_w, uint32_t(src.w));
+    add(plane->id, plane->props.values.crtc_h, uint32_t(src.h));
     add(plane->id, plane->props.values.fb_id, fb->id);
     add(plane->id, plane->props.values.crtc_id, crtc);
 
@@ -320,7 +326,7 @@ void Aquamarine::CDRMAtomicRequest::addConnector(Hyprutils::Memory::CSharedPoint
         if (connector->crtc->props.values.vrr_enabled)
             add(connector->crtc->id, connector->crtc->props.values.vrr_enabled, (uint64_t)STATE.adaptiveSync);
 
-        planeProps(connector->crtc->primary, data.mainFB, connector->crtc->id, {}, STATE.colorRange);
+        planeProps(connector->crtc->primary, data.mainFB, connector->crtc->id, {}, STATE.colorRange, data.primarySource);
 
         if (connector->output->supportsExplicit && (data.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) && STATE.explicitInFence >= 0)
             add(connector->crtc->primary->id, connector->crtc->primary->props.values.in_fence_fd, STATE.explicitInFence);
@@ -769,4 +775,70 @@ bool Aquamarine::CDRMAtomicImpl::moveCursor(SP<SDRMConnector> connector, bool sk
     }
 
     return true;
+}
+
+// A group request owns every head's prepared blobs until the single ioctl
+// succeeds. TEST_ONLY never adopts blobs or changes the connector cache.
+bool CDRMAtomicImpl::commitGroup(std::vector<std::pair<SP<SDRMConnector>, SDRMConnectorCommitData>>& heads, uint32_t flags, uintptr_t token) {
+    if (heads.empty())
+        return false;
+    CDRMAtomicRequest cleanup(backend);
+    size_t            prepared = 0;
+    bool              ready    = true;
+    for (auto& [head, data] : heads) {
+        ++prepared;
+        if (!prepareConnector(head, data)) {
+            ready = false;
+            break;
+        }
+    }
+    // prepareConnector may fail after allocating the mode blob, before
+    // addConnectorModeset has marked it as owned by this transaction.
+    for (size_t i = 0; i < prepared; ++i)
+        heads[i].second.atomic.blobbed = heads[i].second.modeset;
+
+    std::vector<bool> originalMaxBpc;
+    for (const auto& [head, data] : heads)
+        originalMaxBpc.push_back(head->maxBpcFailed);
+    bool success = false;
+    if (ready) {
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            CDRMAtomicRequest request(backend);
+            for (auto& [head, data] : heads)
+                request.addConnector(head, data);
+            const auto result = request.submitAsync(backend->drmFD(), flags, token ? token : 1);
+            if (result.submitted) {
+                success = true;
+                break;
+            }
+            backend->log(AQ_LOG_DEBUG, std::format("drm: tiled atomic commit failed: {}", strerror(result.error)));
+            bool canRetry = false;
+            for (auto& [head, data] : heads) {
+                if (data.atomic.maxBpcEmitted && !head->maxBpcFailed) {
+                    head->maxBpcFailed = true;
+                    canRetry           = true;
+                }
+            }
+            if (!canRetry)
+                break;
+        }
+    }
+    for (size_t i = 0; i < prepared; ++i) {
+        auto& [head, data] = heads[i];
+        cleanup.setConnector(head);
+        // rollback() also writes ownModeID; preserve ownership on tests and
+        // failures so a borrowed mode is not accidentally destroyed later.
+        const bool ownedMode = head->crtc->atomic.ownModeID;
+        if (success && !(flags & DRM_MODE_ATOMIC_TEST_ONLY))
+            finalizeAsync(cleanup, head, data, true);
+        else {
+            cleanup.rollback(data);
+            head->crtc->atomic.ownModeID = ownedMode;
+        }
+    }
+    if (!success || (flags & DRM_MODE_ATOMIC_TEST_ONLY)) {
+        for (size_t i = 0; i < heads.size(); ++i)
+            heads[i].first->maxBpcFailed = originalMaxBpc[i];
+    }
+    return success;
 }
