@@ -174,6 +174,12 @@ target_link_libraries(drmTile PRIVATE PkgConfig::deps aquamarine)
 add_test(NAME drmTile COMMAND drmTile)
 add_dependencies(tests drmTile)
 
+add_executable(drmTileFrame "tests/DRMTileFrame.cpp")
+target_include_directories(drmTileFrame PRIVATE "./src/include")
+target_link_libraries(drmTileFrame PRIVATE PkgConfig::deps aquamarine)
+add_test(NAME drmTileFrame COMMAND drmTileFrame)
+add_dependencies(tests drmTileFrame)
+
 # Installation
 install(TARGETS aquamarine)
 install(DIRECTORY "include/aquamarine" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
