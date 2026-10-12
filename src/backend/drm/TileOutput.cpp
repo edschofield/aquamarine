@@ -176,8 +176,17 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
         group->needsModeset = false;
         state->consume(snapshot);
         events.commit.emit();
-        if (pending.enabled)
+        if (pending.enabled) {
             scheduleFrame(AQ_SCHEDULE_NEEDS_FRAME);
+            if (group->reprobe) {
+                group->reprobe = false;
+                auto weak = backend;
+                backend->backend->addIdleEvent(makeShared<std::function<void(void)>>([weak] {
+                    if (const auto backend = weak.lock())
+                        backend->recheckOutputs();
+                }));
+            }
+        }
         return true;
     }
     const bool wantsFlip = !onlyTest && !group->recovering && pending.enabled && fb && (pending.committed & COutputState::AQ_OUTPUT_STATE_BUFFER);

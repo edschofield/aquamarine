@@ -618,6 +618,13 @@ void Aquamarine::CDRMBackend::restoreAfterVT() {
         }
     }
 
+    for (const auto& head : connectors) {
+        if (!head->output || !head->output->tiled)
+            continue;
+        head->output->tiled->needsModeset = true;
+        if (!head->output->commitTiled())
+            backend->log(AQ_LOG_WARNING, "drm: Could not restore tiled output before probing");
+    }
     recheckOutputs();
 
     backend->log(AQ_LOG_DEBUG, "drm: Rescanned connectors");
@@ -631,9 +638,6 @@ void Aquamarine::CDRMBackend::restoreAfterVT() {
         if (c->tiledOwner) {
             if (c->tiledOwner != c->output)
                 continue;
-            c->output->tiled->needsModeset = true;
-            if (!c->output->commitTiled())
-                c->output->events.state.emit(IOutput::SStateEvent{});
             c->output->scheduleFrame(IOutput::AQ_SCHEDULE_NEW_CONNECTOR);
             continue;
         }
@@ -1170,7 +1174,8 @@ eBackendType Aquamarine::CDRMBackend::type() {
 
 void Aquamarine::CDRMBackend::markRedundantTiles() {
     for (const auto& conn : connectors) {
-        conn->parseTileInfo();
+        if (!conn->tiledOwner)
+            conn->parseTileInfo();
         conn->tilingRedundant = false;
     }
 
@@ -1290,6 +1295,15 @@ void Aquamarine::CDRMBackend::scanConnectors() {
 
     for (int i = 0; i < resources->count_connectors; ++i) {
         uint32_t          connectorID = resources->connectors[i];
+
+        const auto known = std::ranges::find_if(connectors, [connectorID](const auto& c) { return c->id == connectorID; });
+        if (known != connectors.end()) {
+            const auto owner = (*known)->tiledOwner.lock();
+            if (owner && owner->tiled && (owner->tiled->poweredOff || !sessionActive())) {
+                owner->tiled->reprobe = true;
+                continue;
+            }
+        }
 
         SP<SDRMConnector> conn;
         auto              drmConn = drmModeGetConnector(gpu->fd, connectorID);

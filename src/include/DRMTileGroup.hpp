@@ -4,6 +4,7 @@
 
 namespace Aquamarine {
     struct SDRMTileGroup {
+        bool reprobe = false;
         SDRMTilePlan                                                  plan;
         std::vector<Hyprutils::Memory::CSharedPointer<SDRMConnector>> heads;
         bool                                                          poweredOff = false;
