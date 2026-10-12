@@ -1,33 +1,35 @@
 # Experimental native tiled outputs
 
-`AQ_DRM_TILED_OUTPUTS=1` combines two horizontal DRM tiles into one output.
-It is disabled by default. This path is intended for a single physical
-monitor whose driver exposes a separate connector and CRTC for each half.
-Window tiling in the compositor then uses the full logical output normally.
-A driver that already advertises a full-panel mode continues to use that
-mode instead.
+`AQ_DRM_TILED_OUTPUTS=1` lets a compositor use one physical monitor whose
+left and right halves have separate DRM connectors. For the tested iMac,
+two 2560×2880 links become one 5120×2880 output. Hyprland can then tile
+windows across the whole screen without a Hyprland source change.
+
+The feature is experimental and disabled by default. If the driver already
+offers a full-panel mode on one connector, Aquamarine keeps using that mode.
 
 ## Supported configuration
 
-The prototype requires an atomic DRM backend without a multi-GPU blit path,
-a complete single-monitor 2×1 TILE group, distinct available CRTCs, matching
-native timings, and a shared XRGB8888 or ARGB8888 format/modifier pair.
-The tested panel is an iMac 5K whose two 2560×2880 links form a 5120×2880
-output. Connector names and hardware IDs are not hard-coded.
+The prototype requires atomic DRM on one GPU, a complete single-monitor
+2×1 TILE group, and a separate available display controller (CRTC) for each
+half. Both halves must have matching native timings and share an XRGB8888
+or ARGB8888 format/modifier pair. Connector names and hardware IDs are not
+hard-coded.
 
-The compositor sees the origin connector's output name and aggregate mode
-size. Each CRTC receives its own native modeline and scans its rectangle of
-a shared full-size framebuffer. The aggregate size is never submitted as a
-physical modeline. Buffer pins are held per head, and a frame is presented
-only after every member CRTC reports completion. A two-second timeout
-attempts a blocking group modeset if a notification is lost.
+The compositor sees the left connector's name and the full panel size.
+Each CRTC runs at its native timing and reads its half of one shared
+framebuffer. The full-panel size is never sent to either link as a physical
+modeline. Aquamarine keeps buffers alive for each half and reports a frame
+as presented only after both CRTCs finish. If a completion notification is
+lost, a two-second timeout attempts to restore both heads with a blocking
+modeset.
 
-Some panels expose the second link only after the origin uses native timing.
-At startup, an incomplete group with no aggregate mode can activate that
-origin using a black buffer, then probe up to 20 times at 100 ms intervals.
-The buffer remains alive until replacement. Failure leaves ordinary outputs
-available; the backend does not invent a missing tile or promote an output
-that has already been published.
+Some panels expose the second link only after the left link uses native
+timing. At startup, an incomplete group with no full-panel mode can activate
+the left link with a black buffer, then probe up to 20 times at 100 ms
+intervals. That buffer stays alive until replacement. If discovery fails,
+ordinary outputs remain available. An output already published to the
+compositor cannot later become a tiled group.
 
 ## Limits
 
@@ -40,11 +42,14 @@ ACTIVE-only transition is sufficient. VT restore uses a complete group
 modeset when that state cannot be trusted.
 
 Arbitrary topology, multi-GPU operation, rotation, general hotplug and
-suspend/resume are outside the tested scope. Teardown while the seat is
-inactive or a group-disable ioctl fails retains resources; final backend
-destruction in that state still needs a resource-lifetime design. In
-particular, the output/connector/group ownership cycle must not be mistaken
-for a completed teardown. This is a review limitation, not a validated path.
+suspend/resume are outside the tested scope.
+
+Shutdown cleanup still needs work before upstream submission. If the seat
+is inactive or disabling the group fails, Aquamarine retains resources so
+it cannot free buffers that the display may still be reading. The output,
+connectors and group can then keep each other alive even when the backend
+is destroyed. Final cleanup needs to release these references safely after
+the DRM device stops using them. This path has not been validated.
 
 ## Validation
 
