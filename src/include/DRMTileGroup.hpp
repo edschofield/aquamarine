@@ -4,13 +4,13 @@
 
 namespace Aquamarine {
     struct SDRMTileGroup {
-        bool reprobe = false;
         SDRMTilePlan                                                  plan;
+        std::vector<SDRMFormat>                                       formats;
+        bool                                                          reprobe = false;
         std::vector<Hyprutils::Memory::CSharedPointer<SDRMConnector>> heads;
         bool                                                          poweredOff = false;
         size_t                                                        activeMode = 0;
         CDRMTileFrame                                                 frame;
-        uintptr_t                                                     token         = 0;
         unsigned                                                      referenceSeq  = 0;
         timespec                                                      referenceTime = {};
         bool                                                          disconnecting = false;

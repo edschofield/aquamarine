@@ -395,7 +395,6 @@ namespace Aquamarine {
         bool                                           tilingRedundant = false;
         Hyprutils::Memory::CWeakPointer<CDRMOutput>    tiledOwner;
         std::optional<Hyprutils::Math::CBox>           tiledSource;
-        Hyprutils::Math::Vector2D                      maxMode;
 
         bool                                           cursorEnabled = false;
         Hyprutils::Math::Vector2D                      cursorPos, cursorSize, cursorHotspot;

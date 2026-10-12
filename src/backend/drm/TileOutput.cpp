@@ -114,6 +114,13 @@ void CDRMBackend::configureTiledOutputs() {
         std::ranges::sort(heads, {}, [](const auto& h) { return h->tileInfo.tileHLoc; });
         if (std::ranges::any_of(heads, [](const auto& h) { return !h->crtc || !h->crtc->primary; }) || heads[0]->crtc == heads[1]->crtc)
             continue;
+        std::vector<std::vector<SDRMFormat>> headFormats;
+        for (const auto& head : heads)
+            headFormats.push_back(head->crtc->primary->formats);
+        auto formats = intersectDRMTileFormats(headFormats);
+        std::erase_if(formats, [](const auto& f) { return f.drmFormat != DRM_FORMAT_XRGB8888 && f.drmFormat != DRM_FORMAT_ARGB8888; });
+        if (formats.empty())
+            continue;
         auto output             = heads.front()->output;
         output->tiled           = std::make_shared<SDRMTileGroup>();
         output->tiled->watchdog = Hyprutils::OS::CFileDescriptor{timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)};
@@ -122,7 +129,9 @@ void CDRMBackend::configureTiledOutputs() {
             continue;
         }
         output->tiled->heads = heads;
-        output->tiled->plan  = std::move(*plan);
+        // Member CRTCs stay reserved for the lifetime of this group.
+        output->tiled->formats = std::move(formats);
+        output->tiled->plan    = std::move(*plan);
         output->modes.clear();
         for (const auto& mode : output->tiled->plan.modes) {
             auto logical         = makeShared<SOutputMode>();
@@ -155,7 +164,7 @@ void CDRMBackend::configureTiledOutputs() {
 void CDRMOutput::invalidateTiledFrame() {
     if (!tiled)
         return;
-    tiled->frame.cancel(tiled->token);
+    tiled->frame.cancel();
     const itimerspec disarm{};
     timerfd_settime(tiled->watchdog.get(), 0, &disarm, nullptr);
     tiled->needsModeset = true;
@@ -200,9 +209,9 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
         }
         if (!buffer || buffer->size != mode->pixelSize)
             return false;
-        const auto attrs   = buffer->dmabuf();
-        const auto formats = getRenderFormats();
-        const auto format  = std::ranges::find(formats, attrs.format, &SDRMFormat::drmFormat);
+        const auto  attrs   = buffer->dmabuf();
+        const auto& formats = group->formats;
+        const auto  format  = std::ranges::find(formats, attrs.format, &SDRMFormat::drmFormat);
         if (!attrs.success || format == formats.end() || std::ranges::find(format->modifiers, attrs.modifier) == format->modifiers.end())
             return false;
         fb = CDRMFB::create(buffer, backend, nullptr);
@@ -234,8 +243,13 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
     // DPMS preserves the native routing, modelines and framebuffer pins.
     // Detaching the connectors would turn a power transition into hotplug on
     // tiled panels whose second link is powered by the first.
-    const bool sameBuffer = pending.buffer && connector->crtc->primary->front && connector->crtc->primary->front->buffer == pending.buffer;
-    if (!onlyTest && !lastCommitNoBuffer && (!pending.enabled || (group->poweredOff && sameBuffer && group->activeMode == modeIndex))) {
+    const bool sameBuffer  = pending.buffer && connector->crtc->primary->front && connector->crtc->primary->front->buffer == pending.buffer;
+    const auto powerCommit = COutputState::AQ_OUTPUT_STATE_ENABLED | COutputState::AQ_OUTPUT_STATE_BUFFER | COutputState::AQ_OUTPUT_STATE_DAMAGE |
+        COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE | COutputState::AQ_OUTPUT_STATE_EXPLICIT_OUT_FENCE;
+    // An ACTIVE-only request cannot restore state changed by another DRM
+    // master or apply new connector properties alongside the power change.
+    const bool powerOnly = !(pending.committed & ~powerCommit);
+    if (!onlyTest && !lastCommitNoBuffer && !group->needsModeset && powerOnly && (!pending.enabled || (group->poweredOff && sameBuffer && group->activeMode == modeIndex))) {
         auto atomicImpl = dynamic_cast<CDRMAtomicImpl*>(backend->impl.get());
         if (!atomicImpl || !atomicImpl->setGroupActive(group->heads, pending.enabled))
             return false;
@@ -250,7 +264,7 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
             scheduleFrame(AQ_SCHEDULE_NEEDS_FRAME);
             if (group->reprobe) {
                 group->reprobe = false;
-                auto weak = backend;
+                auto weak      = backend;
                 backend->backend->addIdleEvent(makeShared<std::function<void(void)>>([weak] {
                     if (const auto backend = weak.lock())
                         backend->recheckOutputs();
@@ -288,18 +302,16 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
     // Save notification state so a rejected modeset cannot lose the earlier
     // frame's completion. No event dispatch occurs within the atomic ioctl.
     const auto                                   oldFrame = group->frame;
-    const auto                                   oldToken = group->token;
     std::vector<decltype(SDRMCRTC::pendingFlip)> oldFlips;
     if (wantsFlip) {
         std::vector<uint32_t> crtcs;
         for (const auto& head : group->heads)
             crtcs.push_back(head->crtc->id);
-        group->frame.cancel(oldToken);
+        group->frame.cancel();
         if (!group->frame.begin(token, crtcs)) {
             group->frame = oldFrame;
             return false;
         }
-        group->token = token;
         for (const auto& head : group->heads) {
             oldFlips.push_back(head->crtc->pendingFlip);
             head->crtc->armPageFlip(head, false, token);
@@ -309,7 +321,6 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
     const bool ok         = atomicImpl && atomicImpl->commitGroup(commits, flags, token);
     if (!ok && wantsFlip) {
         group->frame = oldFrame;
-        group->token = oldToken;
         for (size_t i = 0; i < group->heads.size(); ++i)
             group->heads[i]->crtc->pendingFlip = oldFlips[i];
     }
@@ -384,16 +395,19 @@ void CDRMOutput::tiledPageFlip(uintptr_t token, uint32_t crtc, unsigned seq, uns
 }
 
 void CDRMOutput::recoverTiledFrame() {
-    if (!tiled)
+    const auto group = tiled;
+    if (!group)
         return;
     uint64_t expirations = 0;
-    if (read(tiled->watchdog.get(), &expirations, sizeof(expirations)) != sizeof(expirations) || !tiled->frame.pending() || !backend->sessionActive())
+    if (read(group->watchdog.get(), &expirations, sizeof(expirations)) != sizeof(expirations) || !group->frame.pending() || !backend->sessionActive())
         return;
     backend->log(AQ_LOG_WARNING, "drm: tiled frame timed out; restoring the complete group with a blocking modeset");
-    tiled->needsModeset = true;
-    tiled->recovering   = true;
+    group->needsModeset = true;
+    group->recovering   = true;
     const bool restored = commitTiled();
-    tiled->recovering   = false;
+    group->recovering   = false;
+    if (tiled != group)
+        return;
     if (!restored) {
         backend->log(AQ_LOG_ERROR, "drm: tiled recovery failed; disabling the complete group before releasing buffers");
         disconnectTiled();
@@ -438,5 +452,7 @@ bool CDRMOutput::disconnectTiled() {
         head->status = status;
     }
     tiled.reset();
+    if (backend->backend->ready)
+        backend->backend->events.pollFDsChanged.emit();
     return true;
 }

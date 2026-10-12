@@ -268,7 +268,9 @@ void Aquamarine::CDRMAtomicRequest::addConnector(Hyprutils::Memory::CSharedPoint
             free(currentMode);
         }
 
-        if (modeDiffers)
+        // A group modeset must restate every member even if its timing is
+        // unchanged, e.g. when restoring a seat or recovering a lost flip.
+        if (modeDiffers || data.primarySource)
             addConnectorModeset(connector, data);
 
         // Setup HDR

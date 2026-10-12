@@ -25,11 +25,8 @@ eDRMTileFrameEvent CDRMTileFrame::presented(uint64_t token, uint32_t crtc) {
     return pending() ? eDRMTileFrameEvent::PENDING : eDRMTileFrameEvent::COMPLETE;
 }
 
-bool CDRMTileFrame::cancel(uint64_t token) {
-    if (!pending() || token != m_token)
-        return false;
+void CDRMTileFrame::cancel() {
     m_remaining.clear();
-    return true;
 }
 
 bool CDRMTileFrame::pending() const {

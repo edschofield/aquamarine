@@ -18,7 +18,7 @@ namespace Aquamarine {
       public:
         bool               begin(uint64_t token, std::span<const uint32_t> crtcs);
         eDRMTileFrameEvent presented(uint64_t token, uint32_t crtc);
-        bool               cancel(uint64_t token);
+        void               cancel();
         bool               pending() const;
 
       private:

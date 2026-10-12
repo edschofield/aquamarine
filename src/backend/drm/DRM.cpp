@@ -994,8 +994,13 @@ void Aquamarine::CDRMBackend::recheckCRTCs() {
             continue;
         }
 
+        // A tiled group releases all CRTCs together after its disable has
+        // succeeded. Deferred teardown must not let another output take one.
+        if (c->tiledOwner)
+            continue;
+
         // disabled outputs release their CRTCs so active outputs get priority
-        if (!c->tiledOwner && c->crtc && c->status == DRM_MODE_CONNECTED && c->output && !c->output->enabledState) {
+        if (c->crtc && c->status == DRM_MODE_CONNECTED && c->output && !c->output->enabledState) {
             backend->log(AQ_LOG_DEBUG, std::format("drm: {} is disabled, releasing crtc {}", c->szName, c->crtc->id));
             c->setCRTC(nullptr);
         }
@@ -1016,7 +1021,7 @@ void Aquamarine::CDRMBackend::recheckCRTCs() {
             if (c->crtc != crtc)
                 continue;
 
-            if (c->status != DRM_MODE_CONNECTED && !c->tilingRedundant)
+            if (c->status != DRM_MODE_CONNECTED && !c->tilingRedundant && !c->tiledOwner)
                 continue;
 
             backend->log(AQ_LOG_DEBUG, std::format("drm: slot {} crtc {} taken by {}, skipping", i, c->crtc->id, c->szName));
@@ -1297,7 +1302,7 @@ void Aquamarine::CDRMBackend::scanConnectors() {
     for (int i = 0; i < resources->count_connectors; ++i) {
         uint32_t          connectorID = resources->connectors[i];
 
-        const auto known = std::ranges::find_if(connectors, [connectorID](const auto& c) { return c->id == connectorID; });
+        const auto        known = std::ranges::find_if(connectors, [connectorID](const auto& c) { return c->id == connectorID; });
         if (known != connectors.end()) {
             const auto owner = (*known)->tiledOwner.lock();
             if (owner && owner->tiled && (owner->tiled->poweredOff || !sessionActive())) {
@@ -1335,12 +1340,6 @@ void Aquamarine::CDRMBackend::scanConnectors() {
         }
 
         conn->status = drmConn->connection;
-
-        conn->maxMode = {};
-        for (int i = 0; i < drmConn->count_modes; ++i) {
-            conn->maxMode.x = std::max<double>(conn->maxMode.x, drmConn->modes[i].hdisplay);
-            conn->maxMode.y = std::max<double>(conn->maxMode.y, drmConn->modes[i].vdisplay);
-        }
 
         if (conn->crtc)
             conn->recheckCRTCProps();
@@ -3313,18 +3312,8 @@ size_t Aquamarine::CDRMOutput::getDeGammaSize() {
 }
 
 std::vector<SDRMFormat> Aquamarine::CDRMOutput::getRenderFormats() {
-    if (tiled) {
-        std::vector<std::vector<SDRMFormat>> formats;
-        for (const auto& head : tiled->heads) {
-            if (!head->crtc || !head->crtc->primary)
-                return {};
-            formats.push_back(head->crtc->primary->formats);
-        }
-        auto common = intersectDRMTileFormats(formats);
-        // Initial group path is SDR, with formats verified by the iMac probe.
-        std::erase_if(common, [](const auto& f) { return f.drmFormat != DRM_FORMAT_XRGB8888 && f.drmFormat != DRM_FORMAT_ARGB8888; });
-        return common;
-    }
+    if (tiled)
+        return tiled->formats;
     if (!connector->crtc || !connector->crtc->primary || connector->crtc->primary->formats.empty()) {
         backend->log(AQ_LOG_ERROR, "Can't get formats: no crtc");
         return {};
