@@ -384,10 +384,11 @@ std::vector<SP<CDRMBackend>> Aquamarine::CDRMBackend::attempt(SP<CBackend> backe
 Aquamarine::CDRMBackend::~CDRMBackend() {
     stopCommitThread();
 
-    for (auto& conn : connectors) {
+    for (auto& conn : connectors)
         conn->disconnect();
-        conn.reset();
-    }
+    // Disconnect callbacks can flush events across the entire connector list.
+    // Keep it intact until every connector has completed teardown.
+    connectors.clear();
 
     if (rendererState.allocator)
         rendererState.allocator->destroyBuffers();
@@ -2293,7 +2294,7 @@ void Aquamarine::SDRMConnector::applyCommit(SDRMConnectorCommitData& data) {
     if (!backend->updateSecondaryRendererState(&data.retiredFBs))
         backend->backend->log(AQ_LOG_ERROR, std::format("drm: Failed to update renderer state for {} on applyCommit", szName));
 
-    if (wasEnabled != output->enabledState) {
+    if (wasEnabled != output->enabledState && !tiledOwner) {
         auto bk = backend.lock();
         if (bk) {
             bk->backend->log(AQ_LOG_DEBUG, std::format("drm: Connector {} enabledState changed {} -> {}", szName, wasEnabled, output->enabledState));

@@ -791,6 +791,12 @@ bool CDRMAtomicImpl::commitGroup(std::vector<std::pair<SP<SDRMConnector>, SDRMCo
             ready = false;
             break;
         }
+        // An SDR group clears HDR metadata; a zero-filled HDR blob would
+        // still ask the driver to transmit an HDR infoframe.
+        if (data.modeset && head->props.values.hdr_output_metadata) {
+            data.atomic.hdrd    = true;
+            data.atomic.hdrBlob = 0;
+        }
     }
     // prepareConnector may fail after allocating the mode blob, before
     // addConnectorModeset has marked it as owned by this transaction.
@@ -841,4 +847,16 @@ bool CDRMAtomicImpl::commitGroup(std::vector<std::pair<SP<SDRMConnector>, SDRMCo
             heads[i].first->maxBpcFailed = originalMaxBpc[i];
     }
     return success;
+}
+
+bool CDRMAtomicImpl::setGroupActive(const std::vector<SP<SDRMConnector>>& heads, bool active) {
+    if (heads.empty())
+        return false;
+    CDRMAtomicRequest request(backend);
+    for (const auto& head : heads) {
+        if (!head->crtc)
+            return false;
+        request.add(head->crtc->id, head->crtc->props.values.active, active);
+    }
+    return request.submitAsync(backend->drmFD(), DRM_MODE_ATOMIC_ALLOW_MODESET, 1).submitted;
 }

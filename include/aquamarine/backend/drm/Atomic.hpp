@@ -11,6 +11,7 @@ namespace Aquamarine {
         virtual bool                                         commit(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data);
         virtual bool                                         reset();
         bool commitGroup(std::vector<std::pair<Hyprutils::Memory::CSharedPointer<SDRMConnector>, SDRMConnectorCommitData>>& heads, uint32_t flags, uintptr_t token);
+        bool setGroupActive(const std::vector<Hyprutils::Memory::CSharedPointer<SDRMConnector>>& heads, bool active);
         virtual bool                                         moveCursor(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, bool skipSchedule = false);
 
         Hyprutils::Memory::CUniquePointer<CDRMAtomicRequest> prepareAsync(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data,

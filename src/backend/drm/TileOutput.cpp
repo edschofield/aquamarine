@@ -161,6 +161,25 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
             return false;
         paused.push_back(head->crtc->id);
     }
+    // DPMS preserves the native routing, modelines and framebuffer pins.
+    // Detaching the connectors would turn a power transition into hotplug on
+    // tiled panels whose second link is powered by the first.
+    const bool sameBuffer = pending.buffer && connector->crtc->primary->front && connector->crtc->primary->front->buffer == pending.buffer;
+    if (!onlyTest && !lastCommitNoBuffer && (!pending.enabled || (group->poweredOff && sameBuffer && group->activeMode == modeIndex))) {
+        auto atomicImpl = dynamic_cast<CDRMAtomicImpl*>(backend->impl.get());
+        if (!atomicImpl || !atomicImpl->setGroupActive(group->heads, pending.enabled))
+            return false;
+        invalidateTiledFrame();
+        for (const auto& head : group->heads)
+            head->output->enabledState = pending.enabled;
+        group->poweredOff   = !pending.enabled;
+        group->needsModeset = false;
+        state->consume(snapshot);
+        events.commit.emit();
+        if (pending.enabled)
+            scheduleFrame(AQ_SCHEDULE_NEEDS_FRAME);
+        return true;
+    }
     const bool wantsFlip = !onlyTest && !group->recovering && pending.enabled && fb && (pending.committed & COutputState::AQ_OUTPUT_STATE_BUFFER);
     uint32_t   flags     = onlyTest ? DRM_MODE_ATOMIC_TEST_ONLY : wantsFlip ? DRM_MODE_PAGE_FLIP_EVENT : 0;
     if (modeset)
@@ -182,7 +201,6 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
         data.outputState.committed = data.committed;
         data.modeInfo              = group->plan.modes[modeIndex].heads[i];
         data.primarySource         = group->heads[i]->tiledSource;
-        data.hdrMetadata           = hdr_output_metadata{};
         if (modeset)
             data.ctm = Mat3x3::identity();
         commits.emplace_back(group->heads[i], std::move(data));
@@ -236,6 +254,8 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
     for (const auto& old : retired)
         connector->releaseFBBuffer(old);
     group->needsModeset = false;
+    group->poweredOff   = !pending.enabled;
+    group->activeMode   = modeIndex;
     if (wantsFlip) {
         const itimerspec timeout{.it_value = {.tv_sec = 2}};
         timerfd_settime(group->watchdog.get(), 0, &timeout, nullptr);
