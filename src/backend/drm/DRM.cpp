@@ -371,6 +371,7 @@ std::vector<SP<CDRMBackend>> Aquamarine::CDRMBackend::attempt(SP<CBackend> backe
         }
 
         drmBackend->dumbAllocator = CDRMDumbAllocator::create(gpu->fd, backend);
+        drmBackend->discoverTiledOutputs();
 
         backends.emplace_back(drmBackend);
 
@@ -1874,8 +1875,11 @@ void Aquamarine::SDRMConnector::releaseFBBuffer(const SP<CDRMFB> fb) {
     if (!fb)
         return;
 
-    if (auto buf = fb->buffer.lock())
+    if (auto buf = fb->buffer.lock()) {
         buf->backendUnpin();
+        if (discoveryBuffer == buf && !buf->backendPinCount())
+            discoveryBuffer.reset();
+    }
 }
 
 void Aquamarine::SDRMConnector::releaseFBReferences(DRMFBList* deferred) {

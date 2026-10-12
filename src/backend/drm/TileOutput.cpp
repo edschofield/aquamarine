@@ -2,6 +2,9 @@
 #include "Shared.hpp"
 #include <aquamarine/backend/drm/Atomic.hpp>
 #include <aquamarine/backend/Session.hpp>
+#include <aquamarine/allocator/DRMDumb.hpp>
+#include <cstring>
+#include <thread>
 #include <hyprutils/utils/ScopeGuard.hpp>
 #include <algorithm>
 #include <unordered_map>
@@ -15,6 +18,73 @@ using namespace Hyprutils::Math;
 using Hyprutils::Utils::CScopeGuard;
 template <typename T>
 using SP = CSharedPointer<T>;
+
+void CDRMBackend::discoverTiledOutputs() {
+    if (!envEnabled("AQ_DRM_TILED_OUTPUTS") || !atomic || shouldBlit() || !dumbAllocator || !sessionActive())
+        return;
+
+    // Some single-monitor panels expose the other link only while their
+    // origin tile is running at native timing. Do this before publishing any
+    // outputs, then run normal connector discovery and topology validation.
+    std::vector<SP<SDRMConnector>> activated;
+    for (const auto& head : connectors) {
+        const auto& tile = head->tileInfo;
+        if (!head->output || head->output->announced || head->tiledOwner || head->tilingRedundant || !head->crtc || !head->crtc->primary || head->status != DRM_MODE_CONNECTED ||
+            !tile.isSingleMonitor || tile.numHTile != 2 || tile.numVTile != 1 || tile.tileHLoc || tile.tileVLoc)
+            continue;
+        const auto peers = std::ranges::count_if(
+            connectors, [&](const auto& peer) { return peer->status == DRM_MODE_CONNECTED && peer->tileInfo.isSingleMonitor && peer->tileInfo.groupId == tile.groupId; });
+        if (peers != 1 || std::ranges::any_of(head->output->modes, [&](const auto& mode) {
+                return mode->pixelSize == Vector2D{double(tile.tileHSize) * tile.numHTile, double(tile.tileVSize) * tile.numVTile};
+            }))
+            continue;
+        const auto native = std::ranges::find_if(head->output->modes,
+                                                 [&](const auto& mode) { return mode->modeInfo && mode->pixelSize == Vector2D{double(tile.tileHSize), double(tile.tileVSize)}; });
+        if (native == head->output->modes.end())
+            continue;
+        auto buffer = dumbAllocator->acquire({.size = (*native)->pixelSize, .format = DRM_FORMAT_XRGB8888, .scanout = true}, nullptr);
+        if (!buffer || !buffer->good())
+            continue;
+        auto [pixels, format, length] = buffer->beginDataPtr(0);
+        if (!pixels)
+            continue;
+        std::memset(pixels, 0, length);
+        buffer->endDataPtr();
+        auto fb = CDRMFB::create(buffer, self, nullptr);
+        if (!fb || fb->dead)
+            continue;
+        SDRMConnectorCommitData data{};
+        data.outputState           = head->output->state->state();
+        data.outputState.enabled   = true;
+        data.outputState.drmFormat = DRM_FORMAT_XRGB8888;
+        data.mainFB                = fb;
+        data.enabled               = true;
+        data.modeset               = true;
+        data.blocking              = true;
+        data.modeInfo              = *(*native)->modeInfo;
+        data.ctm                   = Mat3x3::identity();
+        data.committed             = COutputState::AQ_OUTPUT_STATE_MODE | COutputState::AQ_OUTPUT_STATE_BUFFER | COutputState::AQ_OUTPUT_STATE_CURSOR_SHAPE;
+        data.outputState.committed = data.committed;
+        if (!head->commitState(data)) {
+            log(AQ_LOG_WARNING, std::format("drm: {} native tile discovery modeset failed", head->szName));
+            continue;
+        }
+        // Keep the black scanout alive until a real replacement retires it.
+        head->discoveryBuffer = buffer;
+        activated.push_back(head);
+        log(AQ_LOG_DEBUG, std::format("drm: {} activated at native tile timing for discovery", head->szName));
+    }
+    // Link discovery is asynchronous even though the initial modeset blocks.
+    // Bound this startup-only wait; an absent partner must not hang startup.
+    for (unsigned attempt = 0; !activated.empty() && attempt < 20; ++attempt) {
+        recheckOutputs();
+        std::erase_if(activated, [](const auto& head) { return bool(head->tiledOwner); });
+        if (!activated.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    for (const auto& head : activated)
+        log(AQ_LOG_WARNING, std::format("drm: {} tile discovery timed out; leaving ordinary output available", head->szName));
+}
 
 void CDRMBackend::configureTiledOutputs() {
     if (!envEnabled("AQ_DRM_TILED_OUTPUTS") || !atomic || shouldBlit())

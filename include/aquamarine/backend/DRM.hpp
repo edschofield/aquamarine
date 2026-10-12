@@ -391,6 +391,7 @@ namespace Aquamarine {
         bool                                           canDoVrr = false;
 
         STileInfo                                      tileInfo;
+        Hyprutils::Memory::CSharedPointer<IBuffer>     discoveryBuffer;
         bool                                           tilingRedundant = false;
         Hyprutils::Memory::CWeakPointer<CDRMOutput>    tiledOwner;
         std::optional<Hyprutils::Math::CBox>           tiledSource;
@@ -523,6 +524,7 @@ namespace Aquamarine {
         void     recheckCRTCs();
         void     markRedundantTiles();
         void     configureTiledOutputs();
+        void     discoverTiledOutputs();
         void     buildGlFormats(const std::vector<SGLFormat>& fmts);
         bool     initCommitThread();
         void     stopCommitThread();
