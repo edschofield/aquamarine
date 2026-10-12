@@ -168,6 +168,12 @@ add_test(
   COMMAND commitThread "commitThread")
 add_dependencies(tests commitThread)
 
+add_executable(drmTile "tests/DRMTile.cpp")
+target_include_directories(drmTile PRIVATE "./src/include")
+target_link_libraries(drmTile PRIVATE PkgConfig::deps aquamarine)
+add_test(NAME drmTile COMMAND drmTile)
+add_dependencies(tests drmTile)
+
 # Installation
 install(TARGETS aquamarine)
 install(DIRECTORY "include/aquamarine" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

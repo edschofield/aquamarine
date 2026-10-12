@@ -38,6 +38,7 @@ extern "C" {
 #include "hwdata.hpp"
 #include "Renderer.hpp"
 #include "OutputTiming.hpp"
+#include "DRMTile.hpp"
 #include "AsyncCommit.hpp"
 
 #include <hyprutils/utils/ScopeGuard.hpp>
@@ -1798,22 +1799,13 @@ void Aquamarine::SDRMConnector::parseTileInfo() {
         return;
     }
 
-    // TILE blob is a text string: "group_id:is_single_monitor:num_h:num_v:h_loc:v_loc:h_size:v_size"
-    uint32_t groupId         = 0;
-    int      isSingleMonitor = 0, numH = 0, numV = 0, hLoc = 0, vLoc = 0, hSize = 0, vSize = 0;
-    if (sscanf(blobData, "%u:%d:%d:%d:%d:%d:%d:%d", &groupId, &isSingleMonitor, &numH, &numV, &hLoc, &vLoc, &hSize, &vSize) == 8 && groupId != 0) {
-        tileInfo.groupId         = groupId;
-        tileInfo.isSingleMonitor = isSingleMonitor != 0;
-        tileInfo.numHTile        = numH;
-        tileInfo.numVTile        = numV;
-        tileInfo.tileHLoc        = hLoc;
-        tileInfo.tileVLoc        = vLoc;
-        tileInfo.tileHSize       = hSize;
-        tileInfo.tileVSize       = vSize;
-
+    if (const auto parsed = parseDRMTile(std::string_view(blobData, blobLen)); parsed) {
+        tileInfo = *parsed;
         backend->backend->log(AQ_LOG_DEBUG,
-                              std::format("drm: Connector {} tile info: group={} tiles={}x{} pos=({},{}) size={}x{}", szName, groupId, numH, numV, hLoc, vLoc, hSize, vSize));
-    }
+                              std::format("drm: Connector {} tile info: group={} tiles={}x{} pos=({},{}) size={}x{}", szName, tileInfo.groupId, tileInfo.numHTile,
+                                          tileInfo.numVTile, tileInfo.tileHLoc, tileInfo.tileVLoc, tileInfo.tileHSize, tileInfo.tileVSize));
+    } else
+        backend->backend->log(AQ_LOG_WARNING, std::format("drm: Connector {} has an invalid TILE property", szName));
 
     free(blobData);
 }
