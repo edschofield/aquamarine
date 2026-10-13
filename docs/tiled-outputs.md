@@ -3,7 +3,8 @@
 `AQ_DRM_TILED_OUTPUTS=1` lets a compositor use one physical monitor whose
 left and right halves have separate DRM connectors. For the tested iMac,
 two 2560×2880 links become one 5120×2880 output. Hyprland can then tile
-windows across the whole screen without a Hyprland source change.
+windows across the whole screen. The tested cleanup requires a matching
+consumer rebuild and the [Hyprland shutdown patch](hyprland-drm-shutdown.patch).
 
 The feature is experimental and disabled by default. If the driver already
 offers a full-panel mode on one connector, Aquamarine keeps using that mode.
@@ -44,20 +45,35 @@ modeset when that state cannot be trusted.
 Arbitrary topology, multi-GPU operation, rotation, general hotplug and
 suspend/resume are outside the tested scope.
 
-Shutdown cleanup still needs work before upstream submission. If the seat
-is inactive or disabling the group fails, Aquamarine retains resources so
-it cannot free buffers that the display may still be reading. The output,
-connectors and group can then keep each other alive even when the backend
-is destroyed. Final cleanup needs to release these references safely after
-the DRM device stops using them. This path has not been validated.
+Final shutdown now stops submissions, drains commit work and detaches every
+head before emitting destruction or buffer-release events. A successful
+blocking disable permits buffer release. If the seat is inactive or disabling
+scanout fails, an independent device context retains the buffers and their
+pins while the output, connectors and group detach. Recovery is bounded;
+unresolved resources enter process-lifetime quarantine without release
+notifications. This deliberately retained set is not leak-free cleanup.
+See [DRM shutdown](drm-shutdown.md) for consumer requirements and failure policy.
 
 ## Validation
 
 `drmTile` tests bounded TILE parsing, topology/timing validation, aggregate
 mode detection and format/modifier intersection. `drmTileFrame` tests
 out-of-order, duplicate and stale events, cancellation, and rollback of a
-rejected replacement frame. Build and run with CTest; `simpleWindow` needs
-a running Wayland compositor.
+rejected replacement frame. `drmShutdown` adds 19 cases using production
+lifetime objects and injected DRM operations. All six noninteractive suites
+passed normally and with ASan/UBSan and leak detection on 13 October 2026;
+[reproduction commands](drm-shutdown.md#tests) select those suites explicitly.
+`simpleWindow` needs a running Wayland compositor.
+
+The iMac hardware and matching Hyprland integration passed native 5K and
+ordinary 4K, active shutdown, inactive-session quarantine and deferred
+retirement after seat activation. Compositor checks covered DPMS, VT return,
+scales 1/1.25/2, windows across the seam and fullscreen. Physical observation
+confirmed the center seam and movement onto the external Cinema Display.
+The AMDGPU `enabling link 1 failed: 15` warning recurred during a sanitizer
+trial; its cause remains unresolved. Runtime physical unplug/reconnect,
+suspend/resume and the broader multi-device/lease matrix remain unproven on
+hardware.
 
 Hardware validation must also check both native CRTC modes, matching shared
 framebuffer IDs and source rectangles, lifecycle transitions, and physical

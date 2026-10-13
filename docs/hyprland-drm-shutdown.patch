@@ -1,0 +1,101 @@
+diff --git a/src/Compositor.cpp b/src/Compositor.cpp
+index 1d2d8b9..629e0c1 100644
+--- a/src/Compositor.cpp
++++ b/src/Compositor.cpp
+@@ -612,6 +612,10 @@ void CCompositor::cleanup() {
+     g_pSessionLockManager.reset();
+     g_pHyprRenderer.reset();
+     g_pProtocolManager.reset();
++    // Aquamarine's renderer may share this EGL display. Retire scanout and
++    // destroy its context before the compositor terminates the display.
++    if (m_aqBackend)
++        m_aqBackend->shutdown();
+     g_pHyprOpenGL.reset();
+     Render::g_pShaderLoader.reset();
+     Config::mgr().reset();
+diff --git a/src/pointer/PointerManager.cpp b/src/pointer/PointerManager.cpp
+index e3e81af..7daeeb2 100644
+--- a/src/pointer/PointerManager.cpp
++++ b/src/pointer/PointerManager.cpp
+@@ -38,6 +38,13 @@ UP<CPointerManager>& Pointer::mgr() {
+     return p;
+ }
+ 
++static bool outputSupportsHardwareCursor(const PHLMONITOR& monitor) {
++    if (!monitor || !monitor->m_output)
++        return false;
++    const auto backend = monitor->m_output->getBackend();
++    return backend && (backend->capabilities() & Aquamarine::IBackendImplementation::eBackendCapabilities::AQ_BACKEND_CAPABILITY_POINTER);
++}
++
+ CPointerManager::CPointerManager() {
+     m_hooks.monitorAdded = Event::bus()->m_events.monitor.added.listen([this](PHLMONITOR monitor) {
+         onMonitorLayoutChange();
+@@ -226,8 +233,7 @@ void CPointerManager::recheckEnteredOutputs() {
+ 
+             // if we are using hw cursors, prevent
+             // the cursor from being stuck at the last point.
+-            if (!s->hardwareFailed &&
+-                (s->monitor->m_output->getBackend()->capabilities() & Aquamarine::IBackendImplementation::eBackendCapabilities::AQ_BACKEND_CAPABILITY_POINTER))
++            if (!s->hardwareFailed && outputSupportsHardwareCursor(s->monitor.lock()))
+                 setHWCursorBuffer(s, nullptr);
+ 
+             if (!m_currentCursorImage.surface)
+@@ -277,7 +283,7 @@ void CPointerManager::resetCursorImage(bool apply) {
+         }
+ 
+         if (ms->cursorFrontBuffer) {
+-            if (ms->monitor->m_output->getBackend()->capabilities() & Aquamarine::IBackendImplementation::eBackendCapabilities::AQ_BACKEND_CAPABILITY_POINTER)
++            if (outputSupportsHardwareCursor(ms->monitor.lock()))
+                 ms->monitor->m_output->setCursor(nullptr, {});
+             ms->cursorFrontBuffer = nullptr;
+         }
+@@ -298,7 +304,7 @@ void CPointerManager::updateCursorBackend() {
+     };
+ 
+     for (auto const& m : State::monitorState()->monitors()) {
+-        if (!m->m_enabled || !m->m_dpmsStatus) {
++        if (!m->m_enabled || !m->m_dpmsStatus || !m->m_output || !m->m_output->getBackend()) {
+             Log::logger->log(Log::TRACE, "Not updating hw cursors: disabled / dpms off display");
+             continue;
+         }
+@@ -309,9 +315,7 @@ void CPointerManager::updateCursorBackend() {
+         // previous display manager might have left a cursor on the plane.
+         // so clear the plane once, even if we never have set it ourselves.
+         if (!state->initialPlaneCleared)
+-            state->initialPlaneCleared = state->cursorFrontBuffer ||
+-                !(m->m_output->getBackend()->capabilities() & Aquamarine::IBackendImplementation::eBackendCapabilities::AQ_BACKEND_CAPABILITY_POINTER) ||
+-                setHWCursorBuffer(state, nullptr);
++            state->initialPlaneCleared = state->cursorFrontBuffer || !outputSupportsHardwareCursor(m) || setHWCursorBuffer(state, nullptr);
+ 
+         if (!CROSSES) {
+             if (state->cursorFrontBuffer)
+@@ -379,9 +383,7 @@ void CPointerManager::onCursorMoved() {
+ }
+ 
+ bool CPointerManager::attemptHardwareCursor(SP<CPointerManager::SMonitorPointerState> state) {
+-    auto output = state->monitor->m_output;
+-
+-    if (!(output->getBackend()->capabilities() & Aquamarine::IBackendImplementation::eBackendCapabilities::AQ_BACKEND_CAPABILITY_POINTER))
++    if (!outputSupportsHardwareCursor(state->monitor.lock()))
+         return false;
+ 
+     const auto CURSORPOS = getCursorPosForMonitor(state->monitor.lock());
+@@ -416,7 +418,7 @@ bool CPointerManager::attemptHardwareCursor(SP<CPointerManager::SMonitorPointerS
+ }
+ 
+ bool CPointerManager::setHWCursorBuffer(SP<SMonitorPointerState> state, SP<Aquamarine::IBuffer> buf) {
+-    if (!(state->monitor->m_output->getBackend()->capabilities() & Aquamarine::IBackendImplementation::eBackendCapabilities::AQ_BACKEND_CAPABILITY_POINTER))
++    if (!outputSupportsHardwareCursor(state->monitor.lock()))
+         return false;
+ 
+     const auto HOTSPOT = transformedHotspot(state->monitor.lock());
+@@ -437,6 +439,8 @@ bool CPointerManager::setHWCursorBuffer(SP<SMonitorPointerState> state, SP<Aquam
+ }
+ 
+ SP<Aquamarine::IBuffer> CPointerManager::renderHWCursorBuffer(SP<CPointerManager::SMonitorPointerState> state, SP<Render::ITexture> texture) {
++    if (!outputSupportsHardwareCursor(state->monitor.lock()))
++        return nullptr;
+     auto        maxSize    = state->monitor->m_output->cursorPlaneSize();
+     auto const& cursorSize = m_currentCursorImage.size;
+ 
