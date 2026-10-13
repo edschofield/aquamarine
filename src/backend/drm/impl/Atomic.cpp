@@ -9,6 +9,7 @@
 #include <sstream>
 #include <optional>
 #include "Shared.hpp"
+#include "../Retirement.hpp"
 #include "aquamarine/output/Output.hpp"
 
 using namespace Aquamarine;
@@ -53,7 +54,9 @@ static uint8_t getMaxBPC(uint64_t min, uint64_t max, uint32_t drmFormat) {
 }
 
 Aquamarine::CDRMAtomicRequest::CDRMAtomicRequest(Hyprutils::Memory::CWeakPointer<CDRMBackend> backend_) : backend(backend_), req(drmModeAtomicAlloc()) {
-    if (!req)
+    if (backend)
+        deviceContext = backend->deviceContext;
+    if (!req || !deviceContext)
         failed = true;
 }
 
@@ -421,10 +424,10 @@ bool Aquamarine::CDRMAtomicRequest::commit(uint32_t flagssss) {
 }
 
 void Aquamarine::CDRMAtomicRequest::destroyBlob(uint32_t id) {
-    if (!id)
+    if (!id || !deviceContext || deviceContext->fd() < 0)
         return;
 
-    if (drmModeDestroyPropertyBlob(backend->gpu->fd, id))
+    if (drmModeDestroyPropertyBlob(deviceContext->fd(), id) && backend)
         backend->log(AQ_LOG_ERROR, "atomic drm request: failed to destroy a blob");
 }
 
@@ -510,6 +513,8 @@ void Aquamarine::CDRMAtomicImpl::finalizeAsync(CDRMAtomicRequest& request, SP<SD
 }
 
 bool Aquamarine::CDRMAtomicImpl::prepareConnector(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data) {
+    if (!backend || backend->shuttingDown() || (!data.test && !backend->rememberScanout(*connector)))
+        return false;
     const auto& STATE  = data.outputState;
     const bool  enable = data.enabled;
     const auto& MODE   = STATE.mode ? STATE.mode : STATE.customMode;
@@ -519,7 +524,7 @@ bool Aquamarine::CDRMAtomicImpl::prepareConnector(Hyprutils::Memory::CSharedPoin
             data.atomic.modeBlob = 0;
         else {
             if (drmModeCreatePropertyBlob(connector->backend->gpu->fd, &data.modeInfo, sizeof(drmModeModeInfo), &data.atomic.modeBlob)) {
-                connector->backend->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a modeset blob");
+                connector->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a modeset blob");
                 return false;
             }
 
@@ -531,7 +536,7 @@ bool Aquamarine::CDRMAtomicImpl::prepareConnector(Hyprutils::Memory::CSharedPoin
 
     auto prepareGammaBlob = [connector](uint32_t prop, const std::vector<uint16_t>& gammaLut, uint32_t* blobId) -> bool {
         if (!prop) // TODO: allow this with legacy gamma, perhaps.
-            connector->backend->backend->log(AQ_LOG_ERROR, "atomic drm: failed to commit gamma: no gamma_lut prop");
+            connector->backend->log(AQ_LOG_ERROR, "atomic drm: failed to commit gamma: no gamma_lut prop");
         else if (gammaLut.empty()) {
             *blobId = 0;
             return true;
@@ -547,7 +552,7 @@ bool Aquamarine::CDRMAtomicImpl::prepareConnector(Hyprutils::Memory::CSharedPoin
             }
 
             if (drmModeCreatePropertyBlob(connector->backend->gpu->fd, lut.data(), lut.size() * sizeof(drm_color_lut), blobId)) {
-                connector->backend->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a gamma blob");
+                connector->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a gamma blob");
                 *blobId = 0;
             } else
                 return true;
@@ -569,7 +574,7 @@ bool Aquamarine::CDRMAtomicImpl::prepareConnector(Hyprutils::Memory::CSharedPoin
 
     if (data.ctm.has_value()) {
         if (!connector->crtc->props.values.ctm)
-            connector->backend->backend->log(AQ_LOG_ERROR, "atomic drm: failed to commit ctm: no ctm prop support");
+            connector->backend->log(AQ_LOG_ERROR, "atomic drm: failed to commit ctm: no ctm prop support");
         else {
             static auto doubleToS3132Fixed = [](const double val) -> uint64_t {
                 const uint64_t result = std::abs(val) * (1ULL << 32);
@@ -584,7 +589,7 @@ bool Aquamarine::CDRMAtomicImpl::prepareConnector(Hyprutils::Memory::CSharedPoin
             }
 
             if (drmModeCreatePropertyBlob(connector->backend->gpu->fd, &ctm, sizeof(drm_color_ctm), &data.atomic.ctmBlob)) {
-                connector->backend->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a ctm blob");
+                connector->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a ctm blob");
                 data.atomic.ctmBlob = 0;
             } else
                 data.atomic.ctmd = true;
@@ -593,24 +598,24 @@ bool Aquamarine::CDRMAtomicImpl::prepareConnector(Hyprutils::Memory::CSharedPoin
 
     if ((data.modeset || (data.committed & COutputState::AQ_OUTPUT_STATE_HDR)) && data.hdrMetadata.has_value()) {
         if (!connector->props.values.hdr_output_metadata)
-            connector->backend->backend->log(AQ_LOG_ERROR, "atomic drm: failed to commit hdr metadata: no HDR_OUTPUT_METADATA prop support");
+            connector->backend->log(AQ_LOG_ERROR, "atomic drm: failed to commit hdr metadata: no HDR_OUTPUT_METADATA prop support");
         else {
             if (drmModeCreatePropertyBlob(connector->backend->gpu->fd, &data.hdrMetadata.value(), sizeof(hdr_output_metadata), &data.atomic.hdrBlob)) {
-                connector->backend->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a hdr metadata blob");
+                connector->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a hdr metadata blob");
                 data.atomic.hdrBlob = 0;
                 data.atomic.hdrd    = false;
             } else {
                 data.atomic.hdrd = true;
-                TRACE(connector->backend->backend->log(
-                    AQ_LOG_TRACE,
-                    std::format("atomic drm: setting hdr min {}, max {}, avg {}, content {}, primaries {},{} {},{} {},{} {},{}",
-                                data.hdrMetadata->hdmi_metadata_type1.min_display_mastering_luminance, data.hdrMetadata->hdmi_metadata_type1.max_display_mastering_luminance,
-                                data.hdrMetadata->hdmi_metadata_type1.max_fall, data.hdrMetadata->hdmi_metadata_type1.max_cll,
-                                data.hdrMetadata->hdmi_metadata_type1.display_primaries[0].x, data.hdrMetadata->hdmi_metadata_type1.display_primaries[0].y,
-                                data.hdrMetadata->hdmi_metadata_type1.display_primaries[1].x, data.hdrMetadata->hdmi_metadata_type1.display_primaries[1].y,
-                                data.hdrMetadata->hdmi_metadata_type1.display_primaries[2].x, data.hdrMetadata->hdmi_metadata_type1.display_primaries[2].y,
-                                data.hdrMetadata->hdmi_metadata_type1.display_primaries[0].x, data.hdrMetadata->hdmi_metadata_type1.white_point.x,
-                                data.hdrMetadata->hdmi_metadata_type1.white_point.y)));
+                TRACE(
+                    connector->backend->log(AQ_LOG_TRACE,
+                                            std::format("atomic drm: setting hdr min {}, max {}, avg {}, content {}, primaries {},{} {},{} {},{} {},{}",
+                                                        data.hdrMetadata->hdmi_metadata_type1.min_display_mastering_luminance,
+                                                        data.hdrMetadata->hdmi_metadata_type1.max_display_mastering_luminance, data.hdrMetadata->hdmi_metadata_type1.max_fall,
+                                                        data.hdrMetadata->hdmi_metadata_type1.max_cll, data.hdrMetadata->hdmi_metadata_type1.display_primaries[0].x,
+                                                        data.hdrMetadata->hdmi_metadata_type1.display_primaries[0].y, data.hdrMetadata->hdmi_metadata_type1.display_primaries[1].x,
+                                                        data.hdrMetadata->hdmi_metadata_type1.display_primaries[1].y, data.hdrMetadata->hdmi_metadata_type1.display_primaries[2].x,
+                                                        data.hdrMetadata->hdmi_metadata_type1.display_primaries[2].y, data.hdrMetadata->hdmi_metadata_type1.display_primaries[0].x,
+                                                        data.hdrMetadata->hdmi_metadata_type1.white_point.x, data.hdrMetadata->hdmi_metadata_type1.white_point.y)));
             }
         }
     }
@@ -619,10 +624,10 @@ bool Aquamarine::CDRMAtomicImpl::prepareConnector(Hyprutils::Memory::CSharedPoin
         if (data.damage.empty())
             data.atomic.fbDamage = 0;
         else {
-            TRACE(connector->backend->backend->log(AQ_LOG_TRACE, std::format("atomic drm: clipping damage to pixel size {}", MODE->pixelSize)));
+            TRACE(connector->backend->log(AQ_LOG_TRACE, std::format("atomic drm: clipping damage to pixel size {}", MODE->pixelSize)));
             std::vector<pixman_box32_t> rects = data.damage.copy().intersect(CBox{{}, MODE->pixelSize}).getRects();
             if (drmModeCreatePropertyBlob(connector->backend->gpu->fd, rects.data(), sizeof(pixman_box32_t) * rects.size(), &data.atomic.fbDamage)) {
-                connector->backend->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a damage blob");
+                connector->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a damage blob");
                 return false;
             }
         }
@@ -655,7 +660,7 @@ bool Aquamarine::CDRMAtomicImpl::commit(Hyprutils::Memory::CSharedPointer<SDRMCo
     // on cached page-flips max_bpc is skipped when unchanged, so an unrelated atomic
     // failure must not be misattributed to max_bpc and permanently latch maxBpcFailed.
     if (!ok && data.atomic.maxBpcEmitted && !connector->maxBpcFailed) {
-        connector->backend->backend->log(AQ_LOG_WARNING, "drm: atomic commit failed with max_bpc set, retrying without max_bpc");
+        connector->backend->log(AQ_LOG_WARNING, "drm: atomic commit failed with max_bpc set, retrying without max_bpc");
 
         // Re-build the request without max_bpc (addConnector checks maxBpcFailed
         // and will skip the max_bpc property). The property blobs created in

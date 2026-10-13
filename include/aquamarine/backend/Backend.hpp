@@ -93,6 +93,7 @@ namespace Aquamarine {
         virtual bool                                                       start()                                    = 0;
         virtual std::vector<Hyprutils::Memory::CSharedPointer<SPollFD>>    pollFDs()                                  = 0;
         virtual int                                                        drmFD()                                    = 0;
+        virtual void                                                       shutdown() {}
         virtual bool                                                       dispatchEvents()                           = 0;
         virtual uint32_t                                                   capabilities()                             = 0;
         virtual void                                                       onReady()                                  = 0;
@@ -113,6 +114,7 @@ namespace Aquamarine {
         static Hyprutils::Memory::CSharedPointer<CBackend> create(const std::vector<SBackendImplementationOptions>& backends, const SBackendOptions& options);
 
         ~CBackend();
+        void shutdown();
 
         /* start the backend. Initializes all the stuff, and will return true on success, false on fail. */
         bool start();
@@ -170,6 +172,7 @@ namespace Aquamarine {
         CBackend();
 
         bool                                                                   terminate = false;
+        bool                                                                   shuttingDown = false;
 
         std::vector<SBackendImplementationOptions>                             implementationOptions;
         std::vector<Hyprutils::Memory::CSharedPointer<IBackendImplementation>> implementations;
@@ -196,5 +199,6 @@ namespace Aquamarine {
         } m_sEventLoopInternals;
 
         friend class CDRMBackend;
+        friend class CDRMShutdownTest;
     };
 };

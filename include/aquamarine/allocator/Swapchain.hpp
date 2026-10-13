@@ -31,6 +31,7 @@ namespace Aquamarine {
         // useful if e.g. a commit fails and we don't wanna write to the previous buffer that is
         // in use.
         void rollback();
+        void shutdown();
 
       private:
         CSwapchain(Hyprutils::Memory::CSharedPointer<IAllocator> allocator_, Hyprutils::Memory::CSharedPointer<IBackendImplementation> backendImpl_);
@@ -45,6 +46,7 @@ namespace Aquamarine {
         Hyprutils::Memory::CWeakPointer<IBackendImplementation> backendImpl;
         std::vector<Hyprutils::Memory::CSharedPointer<IBuffer>> buffers;
         int                                                     lastAcquired = 0;
+        bool                                                    terminal     = false;
 
         friend class CGBMBuffer;
     };

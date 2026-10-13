@@ -26,7 +26,7 @@ namespace Aquamarine {
       private:
         CGBMBuffer(const SAllocatorBufferParams& params, Hyprutils::Memory::CWeakPointer<CGBMAllocator> allocator_, Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain);
 
-        Hyprutils::Memory::CWeakPointer<CGBMAllocator> allocator;
+        Hyprutils::Memory::CSharedPointer<CGBMAllocator> allocator;
 
         // gbm stuff
         gbm_bo*      bo         = nullptr;

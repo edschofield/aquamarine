@@ -1,4 +1,5 @@
 #include "DRMTileGroup.hpp"
+#include <utility>
 #include "Shared.hpp"
 #include <aquamarine/backend/drm/Atomic.hpp>
 #include <aquamarine/backend/Session.hpp>
@@ -20,7 +21,7 @@ template <typename T>
 using SP = CSharedPointer<T>;
 
 void CDRMBackend::discoverTiledOutputs() {
-    if (!envEnabled("AQ_DRM_TILED_OUTPUTS") || !atomic || shouldBlit() || !dumbAllocator || !sessionActive())
+    if (shuttingDown() || !envEnabled("AQ_DRM_TILED_OUTPUTS") || !atomic || shouldBlit() || !dumbAllocator || !sessionActive())
         return;
 
     // Some single-monitor panels expose the other link only while their
@@ -87,7 +88,7 @@ void CDRMBackend::discoverTiledOutputs() {
 }
 
 void CDRMBackend::configureTiledOutputs() {
-    if (!envEnabled("AQ_DRM_TILED_OUTPUTS") || !atomic || shouldBlit())
+    if (shuttingDown() || !envEnabled("AQ_DRM_TILED_OUTPUTS") || !atomic || shouldBlit())
         return;
 
     std::unordered_map<uint32_t, std::vector<SP<SDRMConnector>>> groups;
@@ -176,7 +177,7 @@ void CDRMOutput::invalidateTiledFrame() {
 }
 
 bool CDRMOutput::commitTiled(bool onlyTest) {
-    if (!tiled || !backend->sessionActive() || tiled->disconnecting)
+    if (!usable() || !tiled || !backend->sessionActive() || tiled->disconnecting)
         return false;
     const auto group = tiled;
     for (const auto& head : group->heads) {
@@ -230,13 +231,17 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
         if (result <= 0 || !(fence.revents & POLLIN))
             return false;
     }
+    const auto            owner            = backend.lock();
+    const auto            releaseConnector = connector;
     std::vector<uint64_t> paused;
     CScopeGuard           resume([&] {
         for (auto crtc : paused)
-            backend->resumeCommitQueue(crtc);
+            owner->resumeCommitQueue(crtc);
     });
     for (const auto& head : group->heads) {
         if (!backend->pauseCommitQueue(head->crtc->id))
+            return false;
+        if (!usable())
             return false;
         paused.push_back(head->crtc->id);
     }
@@ -342,7 +347,9 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
     // Each head owns a pin. Retire them only after all heads have adopted
     // the accepted state; no half-updated group is visible to release handlers.
     for (const auto& old : retired)
-        connector->releaseFBBuffer(old);
+        releaseConnector->releaseFBBuffer(old);
+    if (!usable())
+        return true;
     group->needsModeset = false;
     group->poweredOff   = !pending.enabled;
     group->activeMode   = modeIndex;
@@ -362,7 +369,7 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
 
 void CDRMOutput::tiledPageFlip(uintptr_t token, uint32_t crtc, unsigned seq, unsigned sec, unsigned usec) {
     const auto group = tiled;
-    if (!group)
+    if (!usable() || !group)
         return;
     const auto result = group->frame.presented(token, crtc);
     if (result == eDRMTileFrameEvent::IGNORED)
@@ -380,9 +387,12 @@ void CDRMOutput::tiledPageFlip(uintptr_t token, uint32_t crtc, unsigned seq, uns
         head->sched.onFrameComplete();
         head->onPresent(true, true, &retired);
     }
+    const auto head = connector;
     for (const auto& old : retired)
-        connector->releaseFBBuffer(old);
-    CFrameRunningGuard running(connector->sched);
+        head->releaseFBBuffer(old);
+    if (!usable())
+        return;
+    CFrameRunningGuard running(head->sched);
     events.present.emit(SPresentEvent{
         .presented = backend->sessionActive(),
         .when      = &group->referenceTime,
@@ -390,13 +400,13 @@ void CDRMOutput::tiledPageFlip(uintptr_t token, uint32_t crtc, unsigned seq, uns
         .refresh   = int(connector->refresh ? 1000000000000LL / connector->refresh : 0),
         .flags     = AQ_OUTPUT_PRESENT_HW_CLOCK | AQ_OUTPUT_PRESENT_HW_COMPLETION | AQ_OUTPUT_PRESENT_VSYNC | AQ_OUTPUT_PRESENT_ZEROCOPY,
     });
-    if (backend->sessionActive() && enabledState && !connector->sched.frameScheduled())
+    if (usable() && backend->sessionActive() && enabledState && !connector->sched.frameScheduled())
         connector->sched.frameReady.emit();
 }
 
 void CDRMOutput::recoverTiledFrame() {
     const auto group = tiled;
-    if (!group)
+    if (!usable() || !group)
         return;
     uint64_t expirations = 0;
     if (read(group->watchdog.get(), &expirations, sizeof(expirations)) != sizeof(expirations) || !group->frame.pending() || !backend->sessionActive())
@@ -421,10 +431,8 @@ void CDRMOutput::recoverTiledFrame() {
 
 bool CDRMOutput::disconnectTiled() {
     const auto group = tiled;
-    if (!group || group->disconnecting)
-        return false;
-    // Retain scanout pins until a blocking disable has actually succeeded.
-    if (!backend->sessionActive())
+    const auto owner = backend.lock();
+    if (!usable() || !group || group->disconnecting || !owner || !owner->sessionActive())
         return false;
     std::vector<std::pair<SP<SDRMConnector>, SDRMConnectorCommitData>> commits;
     for (const auto& head : group->heads) {
@@ -435,24 +443,29 @@ bool CDRMOutput::disconnectTiled() {
         data.blocking = true;
         commits.emplace_back(head, std::move(data));
     }
-    auto atomicImpl = dynamic_cast<CDRMAtomicImpl*>(backend->impl.get());
+    auto atomicImpl = dynamic_cast<CDRMAtomicImpl*>(owner->impl.get());
     if (!atomicImpl || !atomicImpl->commitGroup(commits, DRM_MODE_ATOMIC_ALLOW_MODESET, 0))
         return false;
     group->disconnecting = true;
     invalidateTiledFrame();
-    // Clear ownership before calling the ordinary per-head teardown.
+    DRMFBList retired;
     for (const auto& head : group->heads) {
         head->tiledOwner.reset();
         head->tiledSource.reset();
-        head->output->enabledState = false;
+        head->releaseFBReferences(&retired);
+        if (head->output)
+            head->output->detach();
+        head->retiredOutput = std::move(head->output);
     }
+    if (owner->backend && owner->backend->ready)
+        owner->backend->events.pollFDsChanged.emit();
+    group->watchdog = {};
+    for (const auto& fb : retired)
+        group->heads.front()->releaseFBBuffer(fb);
     for (const auto& head : group->heads) {
-        const auto status = head->status;
-        head->disconnect();
-        head->status = status;
+        const auto output = std::move(head->retiredOutput);
+        if (output && std::exchange(output->announced, false))
+            output->events.destroy.emit();
     }
-    tiled.reset();
-    if (backend->backend->ready)
-        backend->backend->events.pollFDsChanged.emit();
     return true;
 }

@@ -5,6 +5,7 @@
 #include "../output/Output.hpp"
 #include "../input/Input.hpp"
 #include "FrameScheduler.hpp"
+#include "drm/Lifecycle.hpp"
 #include <hyprutils/memory/WeakPtr.hpp>
 #include <hyprutils/memory/Atomic.hpp>
 #include <wayland-client.h>
@@ -13,6 +14,9 @@
 #include <optional>
 
 namespace Aquamarine {
+    class CDRMDeviceContext;
+    struct SDRMImport;
+    class CDRMShutdownTest;
     class CDRMBackend;
     class CDRMFB;
     class CDRMOutput;
@@ -70,6 +74,7 @@ namespace Aquamarine {
         CDRMLease() = default;
 
         void destroy();
+        bool destroyed = false;
 
         friend class CDRMBackend;
     };
@@ -82,6 +87,9 @@ namespace Aquamarine {
                                                                 bool* isNew = nullptr);
 
         void                                             closeHandles();
+        void                                             pin();
+        void                                             unpin();
+        void                                             invalidate();
         // drops the buffer from KMS
         void drop();
 
@@ -102,6 +110,9 @@ namespace Aquamarine {
         void     import();
 
         bool     dropped = false, handlesClosed = false;
+        std::shared_ptr<CDRMDeviceContext> deviceContext;
+        std::shared_ptr<SDRMImport>        importState;
+        friend class CDRMShutdownTest;
 
         struct {
             Hyprutils::Signal::CHyprSignalListener destroyBuffer;
@@ -274,6 +285,10 @@ namespace Aquamarine {
         bool                           disconnectTiled();
         std::shared_ptr<SDRMTileGroup> tiled;
         bool                           announced = false;
+        bool                           detached  = false;
+        bool                           usable() const;
+        void                           quiesce();
+        void                           detach();
         bool prepareAsyncCommitData(const COutputState::CSnapshot& snapshot, SDRMConnectorCommitData& data, Hyprutils::OS::CFileDescriptor& mgpuFence, bool& mgpuAcquired,
                                     bool& requiresSync);
 
@@ -293,6 +308,7 @@ namespace Aquamarine {
         bool                                                               asyncCommitEventPending = false;
         Hyprutils::Memory::CAtomicSharedPointer<CDRMCursorPositionMailbox> cursorMailbox;
 
+        friend class CDRMShutdownTest;
         friend struct SDRMConnector;
         friend class CDRMLease;
         friend class CDRMBackend;
@@ -378,6 +394,7 @@ namespace Aquamarine {
         void                                           setCRTC(Hyprutils::Memory::CSharedPointer<SDRMCRTC> newCRTC);
 
         Hyprutils::Memory::CSharedPointer<CDRMOutput>  output;
+        Hyprutils::Memory::CSharedPointer<CDRMOutput>  retiredOutput;
         Hyprutils::Memory::CWeakPointer<CDRMBackend>   backend;
         Hyprutils::Memory::CWeakPointer<SDRMConnector> self;
         std::string                                    szName;
@@ -471,6 +488,9 @@ namespace Aquamarine {
     class CDRMBackend : public IBackendImplementation {
       public:
         virtual ~CDRMBackend();
+        void                                                               shutdown() override;
+        bool                                                               shuttingDown() const;
+        SDRMShutdownStatus                                                 shutdownStatus() const;
         virtual eBackendType                                               type();
         virtual bool                                                       start();
         virtual std::vector<Hyprutils::Memory::CSharedPointer<SPollFD>>    pollFDs();
@@ -509,6 +529,7 @@ namespace Aquamarine {
         static Hyprutils::Memory::CSharedPointer<CDRMBackend>              fromGpu(std::string path, Hyprutils::Memory::CSharedPointer<CBackend> backend,
                                                                                    Hyprutils::Memory::CSharedPointer<CDRMBackend> primary);
 
+        bool                                                               rememberScanout(const SDRMConnector& connector);
         bool     registerGPU(Hyprutils::Memory::CSharedPointer<CSessionDevice> gpu_, Hyprutils::Memory::CSharedPointer<CDRMBackend> primary_ = {});
         bool     checkFeatures();
         bool     initResources();
@@ -563,6 +584,13 @@ namespace Aquamarine {
         Hyprutils::Memory::CSharedPointer<CDRMDumbAllocator>          dumbAllocator;
 
         bool                                                          atomic = false;
+        enum class eLifecycle {
+            RUNNING,
+            QUIESCING,
+            DETACHED
+        };
+        eLifecycle                         lifecycle = eLifecycle::RUNNING;
+        std::shared_ptr<CDRMDeviceContext> deviceContext;
 
         struct {
             Hyprutils::Math::Vector2D cursorSize;
@@ -591,5 +619,6 @@ namespace Aquamarine {
         friend class CDRMAtomicRequest;
         friend class CDRMLease;
         friend class CGBMBuffer;
+        friend class CDRMShutdownTest;
     };
 };

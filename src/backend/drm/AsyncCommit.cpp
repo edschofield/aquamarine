@@ -52,13 +52,13 @@ void Aquamarine::CDRMAsyncCommitData::pinBuffers() {
 
 void Aquamarine::CDRMAsyncCommitData::releasePins() {
     if (mainPinned && mainBuffer) {
-        mainBuffer->backendUnpin();
         mainPinned = false;
+        mainBuffer->backendUnpin();
     }
 
     if (cursorPinned && cursorBuffer) {
-        cursorBuffer->backendUnpin();
         cursorPinned = false;
+        cursorBuffer->backendUnpin();
     }
 }
 

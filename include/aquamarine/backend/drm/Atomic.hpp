@@ -60,6 +60,7 @@ namespace Aquamarine {
         void                                             rollbackBlob(uint32_t* current, uint32_t next);
 
         Hyprutils::Memory::CWeakPointer<CDRMBackend>     backend;
+        std::shared_ptr<CDRMDeviceContext>               deviceContext;
         drmModeAtomicReq*                                req = nullptr;
         Hyprutils::Memory::CSharedPointer<SDRMConnector> conn;
 

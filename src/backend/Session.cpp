@@ -2,6 +2,9 @@
 #include <cerrno>
 #include <fcntl.h>
 #include "Shared.hpp"
+#include "drm/Retirement.hpp"
+#include <utility>
+#include <cstdio>
 
 extern "C" {
 #include <libseat.h>
@@ -21,10 +24,9 @@ using namespace Hyprutils::Memory;
 
 static const std::string AQ_UNKNOWN_DEVICE_NAME = "UNKNOWN";
 
-// we can't really do better with libseat/libinput logs
-// because they don't allow us to pass "data" or anything...
-// Nobody should create multiple backends anyways really
-Hyprutils::Memory::CSharedPointer<CBackend> backendInUse;
+// Libseat's global log handler has no user data. Logging must neither retain
+// the backend nor enter it while its members are being destroyed.
+static Hyprutils::Memory::CWeakPointer<CBackend> backendInUse;
 
 //
 static Aquamarine::eBackendLogLevel logLevelFromLibseat(libseat_log_level level) {
@@ -47,7 +49,8 @@ static Aquamarine::eBackendLogLevel logLevelFromLibinput(libinput_log_priority l
 }
 
 static void libseatLog(libseat_log_level level, const char* fmt, va_list args) {
-    if (!backendInUse)
+    const auto backend = backendInUse.lock();
+    if (!backend)
         return;
 
     static char string[1024];
@@ -57,11 +60,12 @@ static void libseatLog(libseat_log_level level, const char* fmt, va_list args) {
     for (int len = strlen(string); len > 0 && string[len - 1] == '\n'; --len)
         string[len - 1] = '\0';
 
-    backendInUse->log(logLevelFromLibseat(level), std::format("[libseat] {}", string));
+    backend->log(logLevelFromLibseat(level), std::format("[libseat] {}", string));
 }
 
 static void libinputLog(libinput*, libinput_log_priority level, const char* fmt, va_list args) {
-    if (!backendInUse)
+    const auto backend = backendInUse.lock();
+    if (!backend)
         return;
 
     static char string[1024];
@@ -71,7 +75,7 @@ static void libinputLog(libinput*, libinput_log_priority level, const char* fmt,
     for (int len = strlen(string); len > 0 && string[len - 1] == '\n'; --len)
         string[len - 1] = '\0';
 
-    backendInUse->log(logLevelFromLibinput(level), std::format("[libinput] {}", string));
+    backend->log(logLevelFromLibinput(level), std::format("[libinput] {}", string));
 }
 
 // ------------ Libseat
@@ -104,6 +108,8 @@ static const libseat_seat_listener libseatListener = {
 
 static int libinputOpen(const char* path, int flags, void* data) {
     auto SESSION = (CSession*)data;
+    if (SESSION->shuttingDown)
+        return -ENODEV;
 
     auto dev = makeShared<CSessionDevice>(SESSION->self.lock(), path);
     if (!dev->dev)
@@ -115,13 +121,13 @@ static int libinputOpen(const char* path, int flags, void* data) {
 
 static void libinputClose(int fd, void* data) {
     auto SESSION = (CSession*)data;
-
-    std::erase_if(SESSION->sessionDevices, [fd](const auto& dev) {
-        auto toRemove = dev->fd == fd;
-        if (toRemove)
-            dev->events.remove.emit();
-        return toRemove;
-    });
+    const auto found   = std::find_if(SESSION->sessionDevices.begin(), SESSION->sessionDevices.end(), [fd](const auto& dev) { return dev->fd == fd; });
+    if (found == SESSION->sessionDevices.end())
+        return;
+    const auto device = *found;
+    SESSION->sessionDevices.erase(found);
+    device->events.remove.emit();
+    device->close(SESSION);
 }
 
 static const libinput_interface libinputListener = {
@@ -141,7 +147,7 @@ Aquamarine::CSessionDevice::CSessionDevice(Hyprutils::Memory::CSharedPointer<CSe
     struct stat stat_;
     if (fstat(fd, &stat_) < 0) {
         session->backend->log(AQ_LOG_ERROR, std::format("libseat: Couldn't stat device at {}", path_));
-        deviceID = -1;
+        close(session_.get());
         return;
     }
 
@@ -149,14 +155,30 @@ Aquamarine::CSessionDevice::CSessionDevice(Hyprutils::Memory::CSharedPointer<CSe
 }
 
 Aquamarine::CSessionDevice::~CSessionDevice() {
-    if (deviceID >= 0)
-        if (libseat_close_device(session->libseatHandle, deviceID) < 0)
-            session->backend->log(AQ_LOG_ERROR, std::format("libseat: Couldn't close device at {}", path));
-    if (fd >= 0)
-        close(fd);
+    close();
+}
 
-    if (renderNodeFd >= 0)
-        close(renderNodeFd);
+int Aquamarine::CSessionDevice::close(CSession* owner) {
+    if (closed)
+        return closeError;
+    closed = true;
+    if (const auto context = drmContext.lock())
+        context->deviceClosing();
+    auto keepSession = session.lock();
+    if (!owner)
+        owner = keepSession ? keepSession.get() : closingSession;
+    if (deviceID >= 0 && owner && owner->libseatHandle) {
+        if (libseat_close_device(owner->libseatHandle, deviceID) < 0) {
+            closeError = errno ? errno : EIO;
+            std::fprintf(stderr, "aquamarine: libseat device close failed: %s\n", path.c_str());
+        }
+    }
+    deviceID = -1;
+    if (const int oldFD = std::exchange(fd, -1); oldFD >= 0)
+        ::close(oldFD);
+    if (const int oldFD = std::exchange(renderNodeFd, -1); oldFD >= 0)
+        ::close(oldFD);
+    return closeError;
 }
 
 bool Aquamarine::CSessionDevice::supportsKMS() {
@@ -285,6 +307,8 @@ void Aquamarine::CSessionDevice::resolveMatchingRenderNode(udev_device* cardDevi
 }
 
 SP<CSessionDevice> Aquamarine::CSessionDevice::openIfKMS(SP<CSession> session_, const std::string& path_) {
+    if (!session_ || session_->shuttingDown || !CDRMDeviceContext::canOpen(path_))
+        return nullptr;
     auto dev = makeShared<CSessionDevice>(session_, path_);
     if (envEnabled("AQ_NO_KMS_REQUIREMENT") || dev->supportsKMS())
         return dev;
@@ -375,7 +399,7 @@ SP<CSession> Aquamarine::CSession::attempt(Hyprutils::Memory::CSharedPointer<CBa
 }
 
 Aquamarine::CSession::~CSession() {
-    sessionDevices.clear();
+    shutdown();
     libinputDevices.clear();
 
     if (libinputHandle)
@@ -390,6 +414,30 @@ Aquamarine::CSession::~CSession() {
     libseatHandle = nullptr;
     udevMonitor   = nullptr;
     udevHandle    = nullptr;
+}
+
+void Aquamarine::CSession::shutdown() {
+    if (shuttingDown)
+        return;
+    const auto keepAlive = self.lock();
+    shuttingDown         = true;
+    // Let libinput relinquish its descriptors before the session closes the
+    // remaining devices. It must not keep cached, reusable FD numbers alive.
+    if (libinputHandle)
+        libinput_suspend(libinputHandle);
+    const auto devices = sessionDevices;
+    // Weak locks can already fail in this destructor. Device close still needs
+    // the live libseat owner until this synchronous shutdown call returns.
+    for (const auto& device : devices)
+        device->closingSession = this;
+    for (const auto& device : devices)
+        device->events.remove.emit();
+    events.destroy.emit();
+    for (const auto& device : devices) {
+        device->close(this);
+        device->closingSession = nullptr;
+    }
+    sessionDevices.clear();
 }
 
 static bool isDRMCard(const char* sysname) {
@@ -410,6 +458,8 @@ void Aquamarine::CSession::onReady() {
 }
 
 void Aquamarine::CSession::dispatchUdevEvents() {
+    if (shuttingDown)
+        return;
     if (!udevHandle || !udevMonitor)
         return;
 
@@ -478,6 +528,7 @@ void Aquamarine::CSession::dispatchUdevEvents() {
     } else if (action == std::string{"remove"}) {
         backend->log(AQ_LOG_DEBUG, std::format("udev: DRM device {} removed", sysname ? sysname : "unknown"));
         sessionDevice->events.remove.emit();
+        sessionDevice->close(this);
         std::erase_if(sessionDevices, [sessionDevice](const auto& sd) { return sd == sessionDevice; });
     }
 
@@ -485,7 +536,7 @@ void Aquamarine::CSession::dispatchUdevEvents() {
 }
 
 void Aquamarine::CSession::dispatchLibinputEvents() {
-    if (!libinputHandle)
+    if (shuttingDown || !libinputHandle)
         return;
 
     if (int ret = libinput_dispatch(libinputHandle); ret) {
@@ -495,13 +546,16 @@ void Aquamarine::CSession::dispatchLibinputEvents() {
 
     libinput_event* event = libinput_get_event(libinputHandle);
     while (event) {
-        handleLibinputEvent(event);
+        if (!shuttingDown)
+            handleLibinputEvent(event);
         libinput_event_destroy(event);
         event = libinput_get_event(libinputHandle);
     }
 }
 
 void Aquamarine::CSession::dispatchLibseatEvents() {
+    if (shuttingDown || !libseatHandle)
+        return;
     if (libseat_dispatch(libseatHandle, 0) == -1)
         backend->log(AQ_LOG_ERROR, "Couldn't dispatch libseat events");
 }
@@ -518,13 +572,26 @@ void Aquamarine::CSession::dispatchPendingEventsAsync() {
 }
 
 std::vector<Hyprutils::Memory::CSharedPointer<SPollFD>> Aquamarine::CSession::pollFDs() {
-    // clang-format off
-    return {
-        makeShared<SPollFD>(libseat_get_fd(libseatHandle), [this](){    dispatchLibseatEvents();  }),
-        makeShared<SPollFD>(udev_monitor_get_fd(udevMonitor), [this](){ dispatchUdevEvents();     }),
-        makeShared<SPollFD>(libinput_get_fd(libinputHandle), [this](){  dispatchLibinputEvents(); })
-    };
-    // clang-format on
+    if (shuttingDown)
+        return {};
+    const auto                           weak = self;
+    std::vector<CSharedPointer<SPollFD>> result;
+    if (libseatHandle)
+        result.push_back(makeShared<SPollFD>(libseat_get_fd(libseatHandle), [weak] {
+            if (const auto owner = weak.lock())
+                owner->dispatchLibseatEvents();
+        }));
+    if (udevMonitor)
+        result.push_back(makeShared<SPollFD>(udev_monitor_get_fd(udevMonitor), [weak] {
+            if (const auto owner = weak.lock())
+                owner->dispatchUdevEvents();
+        }));
+    if (libinputHandle)
+        result.push_back(makeShared<SPollFD>(libinput_get_fd(libinputHandle), [weak] {
+            if (const auto owner = weak.lock())
+                owner->dispatchLibinputEvents();
+        }));
+    return result;
 }
 
 bool Aquamarine::CSession::switchVT(uint32_t vt) {

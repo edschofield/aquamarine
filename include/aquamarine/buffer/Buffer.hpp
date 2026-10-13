@@ -61,6 +61,9 @@ namespace Aquamarine {
         void                                           backendPin();
         void                                           backendUnpin();
         uint32_t                                       backendPinCount() const;
+        bool                                           backendRetirementPending() const {
+            return retirementHolds != 0;
+        }
 
         Hyprutils::Math::Vector2D                      size;
         bool                                           opaque          = false;
@@ -76,6 +79,8 @@ namespace Aquamarine {
       private:
         int      locks       = 0;
         uint32_t backendPins = 0;
+        uint32_t retirementHolds = 0;
+        friend class CDRMDeviceContext;
     };
 
 };

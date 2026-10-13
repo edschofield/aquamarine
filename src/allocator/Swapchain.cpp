@@ -20,7 +20,7 @@ Aquamarine::CSwapchain::CSwapchain(SP<IAllocator> allocator_, SP<IBackendImpleme
 }
 
 bool Aquamarine::CSwapchain::reconfigure(const SSwapchainOptions& options_) {
-    if (!allocator)
+    if (terminal || !allocator || !allocator->getBackend())
         return false;
 
     if (options_.size == Vector2D{} || options_.length == 0) {
@@ -60,10 +60,13 @@ bool Aquamarine::CSwapchain::reconfigure(const SSwapchainOptions& options_) {
 }
 
 SP<IBuffer> Aquamarine::CSwapchain::next(int* age) {
-    if (!allocator || options.length <= 0)
+    if (terminal || !allocator || options.length <= 0)
         return nullptr;
 
-    lastAcquired = (lastAcquired + 1) % options.length;
+    const auto next = (lastAcquired + 1) % options.length;
+    if (buffers.at(next)->backendRetirementPending())
+        return nullptr;
+    lastAcquired = next;
 
     if (age)
         *age = options.length; // we always just rotate
@@ -127,6 +130,8 @@ const SSwapchainOptions& Aquamarine::CSwapchain::currentOptions() {
 }
 
 void Aquamarine::CSwapchain::rollback() {
+    if (terminal)
+        return;
     lastAcquired--;
     if (lastAcquired < 0)
         lastAcquired = options.length - 1;
@@ -134,4 +139,12 @@ void Aquamarine::CSwapchain::rollback() {
 
 SP<IAllocator> Aquamarine::CSwapchain::getAllocator() {
     return allocator;
+}
+
+void Aquamarine::CSwapchain::shutdown() {
+    terminal = true;
+    backendImpl.reset();
+    options.scanoutOutput.reset();
+    options.length = 0;
+    buffers.clear();
 }

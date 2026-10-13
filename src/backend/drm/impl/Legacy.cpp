@@ -31,17 +31,17 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
 
     if (enable) {
         if (!data.mainFB)
-            connector->backend->backend->log(AQ_LOG_WARNING, "legacy drm: No buffer, will fall back to only modeset (if present)");
+            connector->backend->log(AQ_LOG_WARNING, "legacy drm: No buffer, will fall back to only modeset (if present)");
         else
             mainFB = data.mainFB;
     }
 
     if (data.modeset) {
-        connector->backend->backend->log(AQ_LOG_DEBUG, std::format("legacy drm: Modesetting CRTC {}", connector->crtc->id));
+        connector->backend->log(AQ_LOG_DEBUG, std::format("legacy drm: Modesetting CRTC {}", connector->crtc->id));
 
         uint32_t dpms = enable ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF;
         if (drmModeConnectorSetProperty(connector->backend->gpu->fd, connector->id, connector->props.values.dpms, dpms)) {
-            connector->backend->backend->log(AQ_LOG_ERROR, "legacy drm: Failed to set dpms");
+            connector->backend->log(AQ_LOG_ERROR, "legacy drm: Failed to set dpms");
             return false;
         }
 
@@ -53,21 +53,21 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
         }
 
         if (mode) {
-            connector->backend->backend->log(
+            connector->backend->log(
                 AQ_LOG_DEBUG,
                 std::format("legacy drm: Modesetting CRTC, mode: clock {} hdisplay {} vdisplay {} vrefresh {}", mode->clock, mode->hdisplay, mode->vdisplay, mode->vrefresh));
         } else
-            connector->backend->backend->log(AQ_LOG_DEBUG, "legacy drm: Modesetting CRTC, mode null");
+            connector->backend->log(AQ_LOG_DEBUG, "legacy drm: Modesetting CRTC, mode null");
 
         if (auto ret = drmModeSetCrtc(connector->backend->gpu->fd, connector->crtc->id, mainFB ? mainFB->id : -1, 0, 0, connectors.data(), connectors.size(), mode); ret) {
-            connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmModeSetCrtc failed: {}", strerror(-ret)));
+            connector->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmModeSetCrtc failed: {}", strerror(-ret)));
             return false;
         }
     }
 
     if (data.committed & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_ADAPTIVE_SYNC) {
         if (STATE.adaptiveSync && !connector->canDoVrr) {
-            connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: connector {} can't do vrr", connector->id));
+            connector->backend->log(AQ_LOG_ERROR, std::format("legacy drm: connector {} can't do vrr", connector->id));
             return false;
         }
 
@@ -75,13 +75,13 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
             if (auto ret =
                     drmModeObjectSetProperty(backend->gpu->fd, connector->crtc->id, DRM_MODE_OBJECT_CRTC, connector->crtc->props.values.vrr_enabled, (uint64_t)STATE.adaptiveSync);
                 ret) {
-                connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmModeObjectSetProperty: vrr -> {} failed: {}", STATE.adaptiveSync, strerror(-ret)));
+                connector->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmModeObjectSetProperty: vrr -> {} failed: {}", STATE.adaptiveSync, strerror(-ret)));
                 return false;
             }
         }
 
         connector->output->vrrActive = STATE.adaptiveSync;
-        connector->backend->backend->log(AQ_LOG_DEBUG, std::format("legacy drm: connector {} vrr -> {}", connector->id, STATE.adaptiveSync));
+        connector->backend->log(AQ_LOG_DEBUG, std::format("legacy drm: connector {} vrr -> {}", connector->id, STATE.adaptiveSync));
     }
 
     // TODO: gamma
@@ -92,13 +92,13 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
         auto     attrs    = data.cursorFB->buffer->dmabuf();
 
         if (int ret = drmPrimeFDToHandle(connector->backend->gpu->fd, attrs.fds.at(0), &boHandle); ret) {
-            connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmPrimeFDToHandle failed: {}", strerror(-ret)));
+            connector->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmPrimeFDToHandle failed: {}", strerror(-ret)));
             return false;
         }
 
-        connector->backend->backend->log(AQ_LOG_DEBUG,
-                                         std::format("legacy drm: cursor fb: {} with bo handle {} from fd {}, size {}", connector->backend->gpu->fd, boHandle,
-                                                     data.cursorFB->buffer->dmabuf().fds.at(0), data.cursorFB->buffer->size));
+        connector->backend->log(AQ_LOG_DEBUG,
+                                std::format("legacy drm: cursor fb: {} with bo handle {} from fd {}, size {}", connector->backend->gpu->fd, boHandle,
+                                            data.cursorFB->buffer->dmabuf().fds.at(0), data.cursorFB->buffer->size));
 
         struct drm_mode_cursor2 request = {
             .flags   = DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE,
@@ -115,14 +115,14 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
         int ret = drmIoctl(connector->backend->gpu->fd, DRM_IOCTL_MODE_CURSOR2, &request);
 
         if (boHandle && drmCloseBufferHandle(connector->backend->gpu->fd, boHandle))
-            connector->backend->backend->log(AQ_LOG_ERROR, "legacy drm: drmCloseBufferHandle in cursor failed");
+            connector->backend->log(AQ_LOG_ERROR, "legacy drm: drmCloseBufferHandle in cursor failed");
 
         if (ret) {
-            connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: cursor drmIoctl failed: {}", strerror(errno)));
+            connector->backend->log(AQ_LOG_ERROR, std::format("legacy drm: cursor drmIoctl failed: {}", strerror(errno)));
             return false;
         }
     } else if (drmModeSetCursor(connector->backend->gpu->fd, connector->crtc->id, 0, 0, 0))
-        connector->backend->backend->log(AQ_LOG_ERROR, "legacy drm: cursor null failed");
+        connector->backend->log(AQ_LOG_ERROR, "legacy drm: cursor null failed");
 
     if (!enable)
         return true;
@@ -133,7 +133,7 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
     const auto FLIPID = connector->crtc->armPageFlip(connector, data.flags & DRM_MODE_PAGE_FLIP_ASYNC);
 
     if (int ret = drmModePageFlip(connector->backend->gpu->fd, connector->crtc->id, mainFB ? mainFB->id : -1, data.flags, rc<void*>(FLIPID)); ret) {
-        connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmModePageFlip failed: {}", strerror(-ret)));
+        connector->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmModePageFlip failed: {}", strerror(-ret)));
         connector->crtc->disarmPageFlip();
         return false;
     }
@@ -148,6 +148,8 @@ bool Aquamarine::CDRMLegacyImpl::testInternal(Hyprutils::Memory::CSharedPointer<
 }
 
 bool Aquamarine::CDRMLegacyImpl::commit(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data) {
+    if (!backend || backend->shuttingDown() || (!data.test && !backend->rememberScanout(*connector)))
+        return false;
     if (!testInternal(connector, data))
         return false;
 
@@ -161,7 +163,7 @@ bool Aquamarine::CDRMLegacyImpl::reset() {
             continue;
 
         if (int ret = drmModeSetCrtc(backend->gpu->fd, connector->crtc->id, 0, 0, 0, nullptr, 0, nullptr); ret) {
-            connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: reset failed: {}", strerror(-ret)));
+            connector->backend->log(AQ_LOG_ERROR, std::format("legacy drm: reset failed: {}", strerror(-ret)));
             ok = false;
         }
     }

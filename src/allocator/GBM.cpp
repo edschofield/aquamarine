@@ -62,7 +62,7 @@ static SDRMFormat guessFormatFrom(std::vector<SDRMFormat> formats, bool cursor, 
 }
 
 Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hyprutils::Memory::CWeakPointer<CGBMAllocator> allocator_,
-                                   Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain) : allocator(allocator_) {
+                                   Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain) : allocator(allocator_.lock()) {
     if (!allocator)
         return;
 
@@ -293,9 +293,10 @@ SDMABUFAttrs Aquamarine::CGBMBuffer::dmabuf() {
 
 std::tuple<uint8_t*, uint32_t, size_t> Aquamarine::CGBMBuffer::beginDataPtr(uint32_t flags) {
     uint32_t stride = 0;
-    if (boBuffer)
-        allocator->backend->log(AQ_LOG_ERROR, "beginDataPtr is called a second time without calling endDataPtr first. Returning old mapping");
-    else
+    if (boBuffer) {
+        if (allocator->backend)
+            allocator->backend->log(AQ_LOG_ERROR, "beginDataPtr is called a second time without calling endDataPtr first. Returning old mapping");
+    } else
         boBuffer = gbm_bo_map(bo, 0, 0, attrs.size.x, attrs.size.y, flags, &stride, &gboMapping);
 
     return {(uint8_t*)boBuffer, attrs.format, stride * attrs.size.y};
@@ -362,6 +363,8 @@ Aquamarine::CGBMAllocator::CGBMAllocator(int fd_, Hyprutils::Memory::CWeakPointe
 }
 
 SP<IBuffer> Aquamarine::CGBMAllocator::acquire(const SAllocatorBufferParams& params, Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain_) {
+    if (!backend)
+        return nullptr;
     if (params.size.x < 1 || params.size.y < 1) {
         backend->log(AQ_LOG_ERROR, std::format("Couldn't allocate a gbm buffer with invalid size {}", params.size));
         return nullptr;

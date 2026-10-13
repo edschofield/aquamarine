@@ -110,15 +110,30 @@ Hyprutils::Memory::CSharedPointer<CBackend> Aquamarine::CBackend::create(const s
 }
 
 Aquamarine::CBackend::~CBackend() {
-    if (idle.fd >= 0)
-        close(idle.fd);
+    shutdown();
+}
 
-    // Tear down implementations before the logger is destroyed,
-    // as backends may log during teardown (e.g. SDRMConnector::disconnect).
+void Aquamarine::CBackend::shutdown() {
+    if (shuttingDown)
+        return;
+    const auto keepAlive = self.lock();
+    shuttingDown         = true;
+    ready                = false;
+    for (const auto& implementation : implementations)
+        implementation->shutdown();
     implementations.clear();
+    if (session)
+        session->shutdown();
+    idle.pending.clear();
+    if (idle.fd >= 0) {
+        close(idle.fd);
+        idle.fd = -1;
+    }
 }
 
 bool Aquamarine::CBackend::start() {
+    if (shuttingDown)
+        return false;
     log(AQ_LOG_DEBUG, "Starting the Aquamarine backend!");
 
     int  started = 0;
@@ -139,7 +154,7 @@ bool Aquamarine::CBackend::start() {
             log(AQ_LOG_ERROR, std::format("Requested backend ({}) could not start, enabling fallbacks", backendTypeToName(impl->type())));
             if (optionsForType(impl->type()).backendRequestMode == AQ_BACKEND_REQUEST_MANDATORY) {
                 log(AQ_LOG_CRITICAL, std::format("Requested backend ({}) could not start and it's mandatory, cannot continue!", backendTypeToName(impl->type())));
-                implementations.clear();
+                shutdown();
                 return false;
             }
         } else
@@ -148,16 +163,25 @@ bool Aquamarine::CBackend::start() {
 
     if (implementations.empty() || started <= 0) {
         log(AQ_LOG_CRITICAL, "No backend could be opened. Make sure there was a correct backend passed to CBackend, and that your environment supports at least one of them.");
+        shutdown();
         return false;
     }
 
-    // erase failed impls
-    std::erase_if(implementations, [this](const auto& i) {
-        bool failed = i->pollFDs().empty() && i->type() != AQ_BACKEND_NULL;
+    // Remove ownership before shutdown emits callbacks; never mutate this
+    // vector reentrantly from inside erase_if.
+    std::vector<SP<IBackendImplementation>> failedImplementations;
+    std::erase_if(implementations, [&](const auto& i) {
+        const bool failed = i->pollFDs().empty() && i->type() != AQ_BACKEND_NULL;
         if (failed)
-            log(AQ_LOG_ERROR, std::format("Implementation {} failed, erasing.", backendTypeToName(i->type())));
+            failedImplementations.push_back(i);
         return failed;
     });
+    for (const auto& implementation : failedImplementations) {
+        log(AQ_LOG_ERROR, std::format("Implementation {} failed, erasing.", backendTypeToName(implementation->type())));
+        implementation->shutdown();
+    }
+    if (shuttingDown)
+        return false;
 
     // TODO: obviously change this when (if) we add different allocators.
     for (auto const& b : implementations) {
@@ -166,6 +190,7 @@ bool Aquamarine::CBackend::start() {
             if (fd < 0) {
                 // this is critical, we cannot create an allocator properly
                 log(AQ_LOG_CRITICAL, "Failed to create an allocator (reopenDRMNode failed)");
+                shutdown();
                 return false;
             }
             primaryAllocator = CGBMAllocator::create(fd, self);
@@ -175,6 +200,7 @@ bool Aquamarine::CBackend::start() {
 
     if (!primaryAllocator && (implementations.empty() || implementations.at(0)->type() != AQ_BACKEND_NULL)) {
         log(AQ_LOG_CRITICAL, "Cannot open backend: no allocator available");
+        shutdown();
         return false;
     }
 
@@ -197,6 +223,8 @@ void Aquamarine::CBackend::log(eBackendLogLevel level, const std::string& msg) {
 }
 
 std::vector<Hyprutils::Memory::CSharedPointer<SPollFD>> Aquamarine::CBackend::getPollFDs() {
+    if (shuttingDown)
+        return {};
     std::vector<Hyprutils::Memory::CSharedPointer<SPollFD>> result;
     for (auto const& i : implementations) {
         auto pollfds = i->pollFDs();
@@ -212,7 +240,11 @@ std::vector<Hyprutils::Memory::CSharedPointer<SPollFD>> Aquamarine::CBackend::ge
     }
 
     log(AQ_LOG_DEBUG, std::format("backend: poll fd {} for idle", idle.fd));
-    result.emplace_back(makeShared<SPollFD>(idle.fd, [this]() { dispatchIdle(); }));
+    if (!shuttingDown && idle.fd >= 0)
+        result.emplace_back(makeShared<SPollFD>(idle.fd, [weak = self] {
+            if (const auto owner = weak.lock(); owner && !owner->shuttingDown)
+                owner->dispatchIdle();
+        }));
 
     return result;
 }
@@ -263,12 +295,16 @@ const std::vector<SP<IBackendImplementation>>& Aquamarine::CBackend::getImplemen
 }
 
 void Aquamarine::CBackend::addIdleEvent(SP<std::function<void(void)>> fn) {
+    if (shuttingDown)
+        return;
     auto r = idle.pending.emplace_back(fn);
 
     updateIdleTimer();
 }
 
 void Aquamarine::CBackend::updateIdleTimer() {
+    if (shuttingDown || idle.fd < 0)
+        return;
     uint64_t ADD_NS = idle.pending.empty() ? TIMESPEC_NSEC_PER_SEC * 240ULL /* 240s, 4 mins */ : 0;
 
     timespec now;
@@ -286,6 +322,8 @@ void Aquamarine::CBackend::removeIdleEvent(SP<std::function<void(void)>> pfn) {
 }
 
 void Aquamarine::CBackend::dispatchIdle() {
+    if (shuttingDown)
+        return;
     if (!CFileDescriptor::isReadable(idle.fd))
         log(AQ_LOG_ERROR, std::format("dispatchIdle: dispatched an non readable idle event on fd : {}", idle.fd));
     else {
@@ -297,6 +335,8 @@ void Aquamarine::CBackend::dispatchIdle() {
     idle.pending.clear();
 
     for (auto const& i : cpy) {
+        if (shuttingDown)
+            break;
         if (i && *i)
             (*i)();
     }
@@ -305,6 +345,8 @@ void Aquamarine::CBackend::dispatchIdle() {
 }
 
 void Aquamarine::CBackend::onNewGpu(std::string path) {
+    if (shuttingDown)
+        return;
     const auto primary    = std::ranges::find_if(implementations, [](SP<IBackendImplementation> value) { return value->type() == Aquamarine::AQ_BACKEND_DRM; });
     const auto primaryDrm = primary != implementations.end() ? ((Aquamarine::CDRMBackend*)(*primary).get())->self.lock() : nullptr;
 
@@ -314,6 +356,7 @@ void Aquamarine::CBackend::onNewGpu(std::string path) {
         return;
     }
     if (!ref->start()) {
+        ref->shutdown();
         log(AQ_LOG_ERROR, std::format("Couldn't start DRM Backend for device {}", path));
         return;
     }

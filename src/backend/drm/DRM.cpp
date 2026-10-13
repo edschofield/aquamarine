@@ -1,4 +1,5 @@
 #include "aquamarine/output/Output.hpp"
+#include "Retirement.hpp"
 #include <algorithm>
 #include <aquamarine/backend/DRM.hpp>
 #include <aquamarine/backend/drm/Legacy.hpp>
@@ -63,19 +64,7 @@ static bool shouldSubmitCTM(SP<SDRMConnector> connector, const COutputState::SIn
     return connector->crtc->props.values.ctm && !connector->crtc->atomic.ctmStateKnown;
 }
 
-Aquamarine::CDRMBackend::CDRMBackend(SP<CBackend> backend_) : backend(backend_) {
-    listeners.sessionActivate = backend->session->events.changeActive.listen([this] {
-        if (backend->session->active) {
-            // session got activated, we need to restore
-            restoreAfterVT();
-        } else
-            for (const auto& connector : connectors) {
-                if (connector->output)
-                    cancelAsyncOutput(connector->output.get(), true);
-                connector->invalidateFrame();
-            }
-    });
-}
+Aquamarine::CDRMBackend::CDRMBackend(SP<CBackend> backend_) : backend(backend_) {}
 
 static udev_enumerate* enumDRMCards(udev* udev) {
     auto enumerate = udev_enumerate_new(udev);
@@ -258,6 +247,8 @@ static std::vector<SP<CSessionDevice>> scanGPUs(SP<CBackend> backend) {
 }
 
 SP<CDRMBackend> Aquamarine::CDRMBackend::fromGpu(std::string path, SP<CBackend> backend, SP<CDRMBackend> primary) {
+    if (!CDRMDeviceContext::canOpen(path))
+        return nullptr;
     auto gpu = CSessionDevice::openIfKMS(backend->session, path);
     if (!gpu) {
         return nullptr;
@@ -286,7 +277,7 @@ SP<CDRMBackend> Aquamarine::CDRMBackend::fromGpu(std::string path, SP<CBackend> 
 
     drmBackend->grabFormats();
 
-    drmBackend->dumbAllocator = CDRMDumbAllocator::create(gpu->fd, backend);
+    drmBackend->dumbAllocator = CDRMDumbAllocator::create(gpu->fd, backend, drmBackend->deviceContext);
 
     // so that session can handle udev change/remove events for this gpu
     backend->session->sessionDevices.push_back(gpu);
@@ -370,7 +361,7 @@ std::vector<SP<CDRMBackend>> Aquamarine::CDRMBackend::attempt(SP<CBackend> backe
             newPrimary = drmBackend;
         }
 
-        drmBackend->dumbAllocator = CDRMDumbAllocator::create(gpu->fd, backend);
+        drmBackend->dumbAllocator = CDRMDumbAllocator::create(gpu->fd, backend, drmBackend->deviceContext);
         drmBackend->discoverTiledOutputs();
 
         backends.emplace_back(drmBackend);
@@ -383,19 +374,93 @@ std::vector<SP<CDRMBackend>> Aquamarine::CDRMBackend::attempt(SP<CBackend> backe
 }
 
 Aquamarine::CDRMBackend::~CDRMBackend() {
+    shutdown();
+}
+
+bool Aquamarine::CDRMBackend::shuttingDown() const {
+    return lifecycle != eLifecycle::RUNNING;
+}
+SDRMShutdownStatus Aquamarine::CDRMBackend::shutdownStatus() const {
+    return deviceContext ? deviceContext->status() : SDRMShutdownStatus{};
+}
+bool Aquamarine::CDRMBackend::rememberScanout(const SDRMConnector& connector) {
+    return !shuttingDown() && deviceContext && deviceContext->rememberHead(connector, atomic);
+}
+
+void Aquamarine::CDRMBackend::shutdown() {
+    if (shuttingDown())
+        return;
+    const auto keepAlive = self.lock();
+    lifecycle            = eLifecycle::QUIESCING;
+    if (deviceContext)
+        deviceContext->beginShutdown();
+    listeners.sessionActivate.reset();
+    listeners.gpuChange.reset();
+    listeners.gpuRemove.reset();
+    idleCallbacks.clear();
+    // Mark every public output terminal before draining callbacks. Keep the
+    // connector list stable until all result accounting has completed.
+    for (const auto& c : connectors) {
+        if (c->output)
+            c->output->quiesce();
+    }
+    if (backend && backend->ready)
+        backend->events.pollFDsChanged.emit();
+    for (const auto& c : connectors) {
+        c->invalidateFrame();
+        if (c->output && c->output->tiled) {
+            c->output->invalidateTiledFrame();
+            c->output->tiled->watchdog = {};
+        }
+    }
     stopCommitThread();
-
-    for (auto& conn : connectors)
-        conn->disconnect();
-    // Disconnect callbacks can flush events across the entire connector list.
-    // Keep it intact until every connector has completed teardown.
+    int leaseError = 0;
+    for (const auto& c : connectors) {
+        if (c->output && c->output->lease && c->output->lease->active) {
+            auto lease    = c->output->lease.lock();
+            lease->active = false;
+            if (!gpu || gpu->fd < 0 || drmModeRevokeLease(gpu->fd, lease->lesseeID) < 0)
+                leaseError = EACCES;
+            lease->backend.reset();
+            lease->destroy();
+        }
+    }
+    // No unpins here: the device ledger already owns each scanout pin and a
+    // strong buffer reference. Clear all heads before any destroy notification.
+    for (const auto& c : connectors) {
+        if (c->crtc) {
+            for (const auto& plane : {c->crtc->primary, c->crtc->cursor}) {
+                if (!plane)
+                    continue;
+                plane->front.reset();
+                plane->back.reset();
+                plane->last.reset();
+                plane->backSet = false;
+            }
+            c->crtc->pendingCursor.reset();
+        }
+        c->status = DRM_MODE_DISCONNECTED;
+        c->tiledOwner.reset();
+        c->tiledSource.reset();
+        if (c->output) {
+            c->output->detach();
+            c->retiredOutput = std::move(c->output);
+        }
+    }
+    for (const auto& c : connectors) {
+        const auto output = std::move(c->retiredOutput);
+        if (output && std::exchange(output->announced, false))
+            output->events.destroy.emit();
+        c->discoveryBuffer.reset();
+    }
+    lifecycle = eLifecycle::DETACHED;
+    if (deviceContext) {
+        deviceContext->finishShutdown(deviceContext->sessionActive(), deviceContext->sessionUsable(), leaseError);
+    }
     connectors.clear();
-
-    if (rendererState.allocator)
-        rendererState.allocator->destroyBuffers();
-
     rendererState.renderer.reset();
     rendererState.allocator.reset();
+    dumbAllocator.reset();
 }
 
 bool Aquamarine::CDRMBackend::initCommitThread() {
@@ -411,6 +476,8 @@ void Aquamarine::CDRMBackend::stopCommitThread() {
         return;
 
     flushAsyncCommitEvents();
+    if (!commitThread)
+        return;
     auto RESULTS = commitThread->stopAndDrain();
     for (auto& result : RESULTS) {
         auto* DATA        = dynamic_cast<CDRMAsyncCommitData*>(result.request->data.get());
@@ -426,10 +493,17 @@ void Aquamarine::CDRMBackend::stopCommitThread() {
         if (SUBMITTED && DATA->connector && DATA->output && DATA->connector->output == DATA->output) {
             DATA->output->state->internalState.drmFormat = DATA->commitData.outputState.drmFormat;
             DATA->connector->applyCommit(DATA->commitData);
+        }
+    }
+    for (auto& result : RESULTS) {
+        auto* DATA = dynamic_cast<CDRMAsyncCommitData*>(result.request->data.get());
+        if (!DATA)
+            continue;
+        const bool SUBMITTED = result.status == CDRMCommitThread::AQ_DRM_COMMIT_THREAD_SUBMITTED;
+        if (DATA->connector) {
             for (const auto& fb : DATA->commitData.retiredFBs)
                 DATA->connector->releaseFBBuffer(fb);
         }
-
         if (!SUBMITTED)
             DATA->rollbackMgpu();
         DATA->releasePins();
@@ -500,13 +574,15 @@ void Aquamarine::CDRMBackend::emitAsyncCommitEvent(SP<CDRMOutput> output) {
 }
 
 void Aquamarine::CDRMBackend::flushAsyncCommitEvents() {
-    for (const auto& connector : connectors) {
+    const auto pending = connectors;
+    for (const auto& connector : pending) {
         if (connector->output && connector->output->asyncCommitEventPending)
             emitAsyncCommitEvent(connector->output);
     }
 }
 
 void Aquamarine::CDRMBackend::dispatchCommitResults() {
+    const auto keepAlive = self.lock();
     if (!commitThread || m_pendingAsyncCommitEvents > 0)
         return;
 
@@ -524,17 +600,26 @@ void Aquamarine::CDRMBackend::dispatchCommitResults() {
 
         const auto OUTPUT    = data->output;
         const auto CONNECTOR = data->connector;
-        const auto CRTC      = CONNECTOR ? CONNECTOR->crtc : nullptr;
 
         if (SUBMITTED && CONNECTOR && OUTPUT && CONNECTOR->output == OUTPUT) {
             OUTPUT->state->internalState.drmFormat = data->commitData.outputState.drmFormat;
             if (data->commitData.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_OUT_FENCE)
                 OUTPUT->state->internalState.explicitOutFence = data->commitData.outputState.explicitOutFence;
             CONNECTOR->applyCommit(data->commitData);
+        }
+    }
+    for (auto& result : results) {
+        auto* data = dynamic_cast<CDRMAsyncCommitData*>(result.request->data.get());
+        if (!data || !data->request || !atomicImpl)
+            continue;
+        const bool SUBMITTED = result.status == CDRMCommitThread::AQ_DRM_COMMIT_THREAD_SUBMITTED;
+        const auto OUTPUT    = data->output;
+        const auto CONNECTOR = data->connector;
+        const auto CRTC      = CONNECTOR ? CONNECTOR->crtc : nullptr;
+        if (CONNECTOR) {
             for (const auto& fb : data->commitData.retiredFBs)
                 CONNECTOR->releaseFBBuffer(fb);
         }
-
         if (!SUBMITTED)
             data->rollbackMgpu();
         data->releasePins();
@@ -542,7 +627,8 @@ void Aquamarine::CDRMBackend::dispatchCommitResults() {
         const bool CURRENT = OUTPUT && result.request->ownerID == OUTPUT->asyncOwnerID && OUTPUT->pendingAsyncCommit == result.request->id;
         if (!CURRENT) {
             if (!SUBMITTED && CRTC) {
-                commitThread->releaseQueue(CRTC->id, result.request->id);
+                if (commitThread)
+                    commitThread->releaseQueue(CRTC->id, result.request->id);
                 if (CRTC->pendingFlip.commitID == result.request->id)
                     CRTC->disarmPageFlip();
             }
@@ -562,7 +648,8 @@ void Aquamarine::CDRMBackend::dispatchCommitResults() {
             if (data->snapshot)
                 OUTPUT->state->rearm(*data->snapshot);
             if (CRTC) {
-                commitThread->releaseQueue(CRTC->id, result.request->id);
+                if (commitThread)
+                    commitThread->releaseQueue(CRTC->id, result.request->id);
                 if (CRTC->pendingFlip.commitID == result.request->id)
                     CRTC->disarmPageFlip();
             }
@@ -590,14 +677,17 @@ void Aquamarine::CDRMBackend::dispatchCommitResults() {
 }
 
 void Aquamarine::CDRMBackend::log(eBackendLogLevel l, const std::string& s) {
-    backend->log(l, s);
+    if (backend)
+        backend->log(l, s);
 }
 
 bool Aquamarine::CDRMBackend::sessionActive() {
-    return backend->session->active;
+    return !shuttingDown() && backend && backend->session && !backend->session->shuttingDown && backend->session->active;
 }
 
 void Aquamarine::CDRMBackend::restoreAfterVT() {
+    if (shuttingDown())
+        return;
     backend->log(AQ_LOG_DEBUG, "drm: Restoring after VT switch");
 
     // Clear stale page-flip bookkeeping for all connectors.
@@ -908,7 +998,7 @@ bool Aquamarine::CDRMBackend::initMgpu() {
 }
 
 bool Aquamarine::CDRMBackend::updateSecondaryRendererState(DRMFBList* deferred) {
-    if (!backend->ready)
+    if (shuttingDown() || !backend || !backend->ready)
         return true;
 
     if (!primary) {
@@ -951,10 +1041,8 @@ bool Aquamarine::CDRMBackend::updateSecondaryRendererState(DRMFBList* deferred) 
         for (auto& fb : retired)
             deferred->emplace_back(std::move(fb));
     } else {
-        for (const auto& fb : retired) {
-            if (auto buffer = fb->buffer.lock())
-                buffer->backendUnpin();
-        }
+        for (const auto& fb : retired)
+            fb->unpin();
     }
 
     return true;
@@ -982,6 +1070,8 @@ void Aquamarine::CDRMBackend::buildGlFormats(const std::vector<SGLFormat>& fmts)
 }
 
 void Aquamarine::CDRMBackend::recheckCRTCs() {
+    if (shuttingDown())
+        return;
     if (connectors.empty() || crtcs.empty())
         return;
 
@@ -1119,6 +1209,29 @@ bool Aquamarine::CDRMBackend::grabFormats() {
 bool Aquamarine::CDRMBackend::registerGPU(SP<CSessionDevice> gpu_, SP<CDRMBackend> primary_) {
     gpu     = gpu_;
     primary = primary_;
+    if (!CDRMDeviceContext::canOpen(gpu->path))
+        return false;
+    try {
+        deviceContext = CDRMDeviceContext::create(gpu, backend->session, backend);
+    } catch (const std::bad_alloc&) {
+        log(AQ_LOG_ERROR, "drm: Cannot provision device retirement ownership");
+        return false;
+    }
+
+    listeners.sessionActivate = backend->session->events.changeActive.listen([weak = self] {
+        const auto owner = weak.lock();
+        if (!owner || owner->shuttingDown() || !owner->backend || !owner->backend->session)
+            return;
+        if (owner->sessionActive())
+            owner->restoreAfterVT();
+        else {
+            for (const auto& connector : owner->connectors) {
+                if (connector->output)
+                    owner->cancelAsyncOutput(connector->output.get(), true);
+                connector->invalidateFrame();
+            }
+        }
+    });
 
     auto driverFromName = [](const std::string_view name) {
         if (name == "i915" || name == "xe")
@@ -1156,19 +1269,30 @@ bool Aquamarine::CDRMBackend::registerGPU(SP<CSessionDevice> gpu_, SP<CDRMBacken
 
     if (drmVer)
         drmFreeVersion(drmVer);
-    listeners.gpuChange = gpu->events.change.listen([this](const CSessionDevice::SChangeEvent& E) {
+    listeners.gpuChange = gpu->events.change.listen([weak = self](const CSessionDevice::SChangeEvent& E) {
+        const auto owner = weak.lock();
+        if (!owner || owner->shuttingDown())
+            return;
+        auto* const self = owner.get();
         if (E.type == CSessionDevice::AQ_SESSION_EVENT_CHANGE_HOTPLUG) {
-            backend->log(AQ_LOG_DEBUG, std::format("drm: Got a hotplug event for {}", gpuName));
-            recheckOutputs();
+            self->backend->log(AQ_LOG_DEBUG, std::format("drm: Got a hotplug event for {}", self->gpuName));
+            self->recheckOutputs();
         } else if (E.type == CSessionDevice::AQ_SESSION_EVENT_CHANGE_LEASE) {
-            backend->log(AQ_LOG_DEBUG, std::format("drm: Got a lease event for {}", gpuName));
-            scanLeases();
+            self->backend->log(AQ_LOG_DEBUG, std::format("drm: Got a lease event for {}", self->gpuName));
+            self->scanLeases();
         }
     });
 
-    listeners.gpuRemove = gpu->events.remove.listen([this] {
-        std::erase_if(backend->implementations, [this](const auto& impl) { return impl->drmFD() == this->drmFD(); });
-        backend->events.pollFDsChanged.emit();
+    listeners.gpuRemove = gpu->events.remove.listen([weak = self] {
+        const auto owner = weak.lock();
+        if (!owner || owner->shuttingDown())
+            return;
+        const auto root = owner->backend.lock();
+        owner->shutdown();
+        if (root && !root->shuttingDown) {
+            std::erase_if(root->implementations, [&](const auto& impl) { return impl.get() == owner.get(); });
+            root->events.pollFDsChanged.emit();
+        }
     });
 
     return true;
@@ -1234,6 +1358,8 @@ void Aquamarine::CDRMBackend::markRedundantTiles() {
 }
 
 void Aquamarine::CDRMBackend::recheckOutputs() {
+    if (shuttingDown())
+        return;
     scanConnectors();
     markRedundantTiles();
 
@@ -1291,6 +1417,8 @@ void Aquamarine::CDRMBackend::recheckOutputs() {
 }
 
 void Aquamarine::CDRMBackend::scanConnectors() {
+    if (shuttingDown())
+        return;
     backend->log(AQ_LOG_DEBUG, std::format("drm: Scanning connectors for {}", gpu->path));
 
     auto resources = drmModeGetResources(gpu->fd);
@@ -1409,27 +1537,36 @@ bool Aquamarine::CDRMBackend::start() {
 }
 
 std::vector<Hyprutils::Memory::CSharedPointer<SPollFD>> Aquamarine::CDRMBackend::pollFDs() {
-    std::vector<SP<SPollFD>> fds = {makeShared<SPollFD>(gpu->fd, [this]() { dispatchEvents(); })};
+    if (shuttingDown() || !gpu || gpu->fd < 0)
+        return {};
+    const auto               weak = self;
+    std::vector<SP<SPollFD>> fds  = {makeShared<SPollFD>(gpu->fd, [weak] {
+        if (const auto owner = weak.lock(); owner && !owner->shuttingDown())
+            owner->dispatchEvents();
+    })};
     if (commitThread)
-        fds.emplace_back(makeShared<SPollFD>(commitThread->completionFD(), [this]() { dispatchCommitResults(); }));
+        fds.emplace_back(makeShared<SPollFD>(commitThread->completionFD(), [weak] {
+            if (const auto owner = weak.lock(); owner && !owner->shuttingDown())
+                owner->dispatchCommitResults();
+        }));
     for (const auto& head : connectors) {
         if (!head->output || !head->output->tiled)
             continue;
-        auto owner = head->output->self;
-        fds.emplace_back(makeShared<SPollFD>(head->output->tiled->watchdog.get(), [owner]() {
-            if (const auto output = owner.lock())
-                output->recoverTiledFrame();
+        const auto output = head->output->self;
+        fds.emplace_back(makeShared<SPollFD>(head->output->tiled->watchdog.get(), [output] {
+            if (const auto owner = output.lock(); owner && owner->usable())
+                owner->recoverTiledFrame();
         }));
     }
     return fds;
 }
 
 int Aquamarine::CDRMBackend::drmFD() {
-    return gpu->fd;
+    return gpu ? gpu->fd : -1;
 }
 
 int Aquamarine::CDRMBackend::drmRenderNodeFD() {
-    return gpu->renderNodeFd;
+    return gpu ? gpu->renderNodeFd : -1;
 }
 
 eBackendGPUDriver Aquamarine::CDRMBackend::gpuDriver() {
@@ -1483,6 +1620,8 @@ static void                      handlePF(int fd, unsigned seq, unsigned tv_sec,
 }
 
 void Aquamarine::CDRMBackend::handlePageFlip(uintptr_t flipID, unsigned int seq, unsigned int sec, unsigned int usec, uint32_t crtcID) {
+    if (shuttingDown())
+        return;
     const auto CRTC = crtcByID(crtcID);
     if (!CRTC || !flipID || CRTC->pendingFlip.id != flipID) {
         log(AQ_LOG_DEBUG, std::format("drm: Ignoring a stale pf event, flip {} on crtc {}", flipID, crtcID));
@@ -1538,6 +1677,9 @@ void Aquamarine::CDRMBackend::handlePageFlip(uintptr_t flipID, unsigned int seq,
 
     if (!ASYNC || COMMIT_ID) {
         CONNECTOR->onPresent();
+        if (shuttingDown() || !CONNECTOR->output)
+            return;
+        const auto output = CONNECTOR->output;
 
         uint32_t flags = IOutput::AQ_OUTPUT_PRESENT_HW_CLOCK | IOutput::AQ_OUTPUT_PRESENT_HW_COMPLETION | IOutput::AQ_OUTPUT_PRESENT_ZEROCOPY;
         if (!ASYNC)
@@ -1548,7 +1690,7 @@ void Aquamarine::CDRMBackend::handlePageFlip(uintptr_t flipID, unsigned int seq,
         if (gpuDriver() == AQ_BACKEND_GPU_DRIVER_NVIDIA && seq == 0)
             flags &= ~IOutput::AQ_OUTPUT_PRESENT_HW_CLOCK;
 
-        CONNECTOR->output->events.present.emit(IOutput::SPresentEvent{
+        output->events.present.emit(IOutput::SPresentEvent{
             .presented = sessionActive(),
             .when      = &presented,
             .seq       = seq,
@@ -1558,11 +1700,13 @@ void Aquamarine::CDRMBackend::handlePageFlip(uintptr_t flipID, unsigned int seq,
         });
     }
 
-    if (sessionActive() && CONNECTOR->output->enabledState && !CONNECTOR->sched.frameScheduled())
+    if (sessionActive() && CONNECTOR->output && CONNECTOR->output->enabledState && !CONNECTOR->sched.frameScheduled())
         CONNECTOR->sched.frameReady.emit();
 }
 
 bool Aquamarine::CDRMBackend::dispatchEvents() {
+    if (shuttingDown())
+        return false;
     drmEventContext event = {
         .version            = 3,
         .page_flip_handler2 = ::handlePF,
@@ -1590,6 +1734,8 @@ bool Aquamarine::CDRMBackend::setCursor(SP<IBuffer> buffer, const Hyprutils::Mat
 }
 
 void Aquamarine::CDRMBackend::onReady() {
+    if (shuttingDown())
+        return;
     backend->log(AQ_LOG_DEBUG, std::format("drm: Connectors size2 {}", connectors.size()));
 
     // init a drm renderer to gather gl formats.
@@ -1722,9 +1868,9 @@ bool Aquamarine::SDRMPlane::init(drmModePlane* plane) {
 
     initialID = id;
 
-    backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Plane {} has type {}", id, (int)type));
+    backend->log(AQ_LOG_DEBUG, std::format("drm: Plane {} has type {}", id, (int)type));
 
-    backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Plane {} has {} formats", id, plane->count_formats));
+    backend->log(AQ_LOG_DEBUG, std::format("drm: Plane {} has {} formats", id, plane->count_formats));
 
     for (size_t i = 0; i < plane->count_formats; ++i) {
         if (type != DRM_PLANE_TYPE_CURSOR)
@@ -1732,21 +1878,21 @@ bool Aquamarine::SDRMPlane::init(drmModePlane* plane) {
         else
             formats.emplace_back(SDRMFormat{.drmFormat = plane->formats[i], .modifiers = {DRM_FORMAT_MOD_LINEAR}});
 
-        TRACE(backend->backend->log(AQ_LOG_TRACE, std::format("drm: | Format {}", fourccToName(plane->formats[i]))));
+        TRACE(backend->log(AQ_LOG_TRACE, std::format("drm: | Format {}", fourccToName(plane->formats[i]))));
     }
 
     if (props.values.in_formats && backend->drmProps.supportsAddFb2Modifiers) {
-        backend->backend->log(AQ_LOG_DEBUG, "drm: Plane: checking for modifiers");
+        backend->log(AQ_LOG_DEBUG, "drm: Plane: checking for modifiers");
 
         uint64_t blobID = 0;
         if (!getDRMProp(backend->gpu->fd, id, props.values.in_formats, &blobID)) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Plane: No blob id");
+            backend->log(AQ_LOG_ERROR, "drm: Plane: No blob id");
             return false;
         }
 
         auto blob = drmModeGetPropertyBlob(backend->gpu->fd, blobID);
         if (!blob) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Plane: No property");
+            backend->log(AQ_LOG_ERROR, "drm: Plane: No property");
             return false;
         }
 
@@ -1754,7 +1900,7 @@ bool Aquamarine::SDRMPlane::init(drmModePlane* plane) {
         while (drmModeFormatModifierBlobIterNext(blob, &iter)) {
             auto it = std::ranges::find_if(formats, [iter](const auto& e) { return e.drmFormat == iter.fmt; });
 
-            TRACE(backend->backend->log(AQ_LOG_TRACE, std::format("drm: | Modifier 0x{:x} : {} with format {}", iter.mod, drmModifierToName(iter.mod), fourccToName(iter.fmt))));
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("drm: | Modifier 0x{:x} : {} with format {}", iter.mod, drmModifierToName(iter.mod), fourccToName(iter.fmt))));
 
             if (it == formats.end())
                 formats.emplace_back(SDRMFormat{.drmFormat = iter.fmt, .modifiers = {iter.mod}});
@@ -1788,36 +1934,36 @@ bool Aquamarine::SDRMPlane::init(drmModePlane* plane) {
 SP<SDRMCRTC> Aquamarine::SDRMConnector::getCurrentCRTC(const drmModeConnector* connector) {
     uint32_t crtcID = 0;
     if (props.values.crtc_id) {
-        TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Using crtc_id for finding crtc"));
+        TRACE(backend->log(AQ_LOG_TRACE, "drm: Using crtc_id for finding crtc"));
         uint64_t value = 0;
         if (!getDRMProp(backend->gpu->fd, id, props.values.crtc_id, &value)) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Failed to get CRTC_ID");
+            backend->log(AQ_LOG_ERROR, "drm: Failed to get CRTC_ID");
             return nullptr;
         }
         crtcID = static_cast<uint32_t>(value);
     } else if (connector->encoder_id) {
-        TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Using encoder_id for finding crtc"));
+        TRACE(backend->log(AQ_LOG_TRACE, "drm: Using encoder_id for finding crtc"));
         auto encoder = drmModeGetEncoder(backend->gpu->fd, connector->encoder_id);
         if (!encoder) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: drmModeGetEncoder failed");
+            backend->log(AQ_LOG_ERROR, "drm: drmModeGetEncoder failed");
             return nullptr;
         }
         crtcID = encoder->crtc_id;
         drmModeFreeEncoder(encoder);
     } else {
-        backend->backend->log(AQ_LOG_ERROR, "drm: Connector has neither crtc_id nor encoder_id");
+        backend->log(AQ_LOG_ERROR, "drm: Connector has neither crtc_id nor encoder_id");
         return nullptr;
     }
 
     if (crtcID == 0) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: getCurrentCRTC: No CRTC 0");
+        backend->log(AQ_LOG_ERROR, "drm: getCurrentCRTC: No CRTC 0");
         return nullptr;
     }
 
     auto it = std::find_if(backend->crtcs.begin(), backend->crtcs.end(), [crtcID](const auto& e) { return e->id == crtcID; });
 
     if (it == backend->crtcs.end()) {
-        backend->backend->log(AQ_LOG_ERROR, std::format("drm: Failed to find a CRTC with ID {}", crtcID));
+        backend->log(AQ_LOG_ERROR, std::format("drm: Failed to find a CRTC with ID {}", crtcID));
         return nullptr;
     }
 
@@ -1835,11 +1981,11 @@ bool Aquamarine::SDRMConnector::init(drmModeConnector* connector) {
         name = "ERROR";
 
     szName = std::format("{}-{}", name, connector->connector_type_id);
-    backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Connector gets name {}", szName));
+    backend->log(AQ_LOG_DEBUG, std::format("drm: Connector gets name {}", szName));
 
     possibleCrtcs = drmModeConnectorGetPossibleCrtcs(backend->gpu->fd, connector);
     if (!possibleCrtcs)
-        backend->backend->log(AQ_LOG_ERROR, "drm: No CRTCs possible");
+        backend->log(AQ_LOG_ERROR, "drm: No CRTCs possible");
 
     setCRTC(getCurrentCRTC(connector));
 
@@ -1861,11 +2007,11 @@ void Aquamarine::SDRMConnector::parseTileInfo() {
 
     if (const auto parsed = parseDRMTile(std::string_view(blobData, blobLen)); parsed) {
         tileInfo = *parsed;
-        backend->backend->log(AQ_LOG_DEBUG,
-                              std::format("drm: Connector {} tile info: group={} tiles={}x{} pos=({},{}) size={}x{}", szName, tileInfo.groupId, tileInfo.numHTile,
-                                          tileInfo.numVTile, tileInfo.tileHLoc, tileInfo.tileVLoc, tileInfo.tileHSize, tileInfo.tileVSize));
+        backend->log(AQ_LOG_DEBUG,
+                     std::format("drm: Connector {} tile info: group={} tiles={}x{} pos=({},{}) size={}x{}", szName, tileInfo.groupId, tileInfo.numHTile, tileInfo.numVTile,
+                                 tileInfo.tileHLoc, tileInfo.tileVLoc, tileInfo.tileHSize, tileInfo.tileVSize));
     } else
-        backend->backend->log(AQ_LOG_WARNING, std::format("drm: Connector {} has an invalid TILE property", szName));
+        backend->log(AQ_LOG_WARNING, std::format("drm: Connector {} has an invalid TILE property", szName));
 
     free(blobData);
 }
@@ -1875,7 +2021,7 @@ void Aquamarine::SDRMConnector::releaseFBBuffer(const SP<CDRMFB> fb) {
         return;
 
     if (auto buf = fb->buffer.lock()) {
-        buf->backendUnpin();
+        fb->unpin();
         if (discoveryBuffer == buf && !buf->backendPinCount())
             discoveryBuffer.reset();
     }
@@ -1967,7 +2113,7 @@ IOutput::SParsedEDID Aquamarine::SDRMConnector::parseEDID(std::vector<uint8_t> d
     auto                 info   = di_info_parse_edid(data.data(), data.size());
     IOutput::SParsedEDID parsed = {};
     if (!info) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: failed to parse edid");
+        backend->log(AQ_LOG_ERROR, "drm: failed to parse edid");
         return parsed;
     }
 
@@ -2000,15 +2146,15 @@ IOutput::SParsedEDID Aquamarine::SDRMConnector::parseEDID(std::vector<uint8_t> d
             .blue  = IOutput::xy{.x = chromaticity->blue_x, .y = chromaticity->blue_y},
             .white = IOutput::xy{.x = chromaticity->white_x, .y = chromaticity->white_y},
         };
-        TRACE(backend->backend->log(AQ_LOG_TRACE,
-                                    std::format("EDID: chromaticity coords {},{} {},{} {},{} {},{}", parsed.chromaticityCoords->red.x, parsed.chromaticityCoords->red.y,
-                                                parsed.chromaticityCoords->green.x, parsed.chromaticityCoords->green.y, parsed.chromaticityCoords->blue.x,
-                                                parsed.chromaticityCoords->blue.y, parsed.chromaticityCoords->white.y, parsed.chromaticityCoords->white.y)));
+        TRACE(backend->log(AQ_LOG_TRACE,
+                           std::format("EDID: chromaticity coords {},{} {},{} {},{} {},{}", parsed.chromaticityCoords->red.x, parsed.chromaticityCoords->red.y,
+                                       parsed.chromaticityCoords->green.x, parsed.chromaticityCoords->green.y, parsed.chromaticityCoords->blue.x, parsed.chromaticityCoords->blue.y,
+                                       parsed.chromaticityCoords->white.y, parsed.chromaticityCoords->white.y)));
     }
 
     const auto* hdr_static_metadata = di_info_get_hdr_static_metadata(info);
     if (hdr_static_metadata && (hdr_static_metadata->pq || hdr_static_metadata->hlg)) {
-        TRACE(backend->backend->log(AQ_LOG_TRACE, std::format("EDID: found HDR pq={} hlg={}", hdr_static_metadata->pq, hdr_static_metadata->hlg)));
+        TRACE(backend->log(AQ_LOG_TRACE, std::format("EDID: found HDR pq={} hlg={}", hdr_static_metadata->pq, hdr_static_metadata->hlg)));
         parsed.hdrMetadata = IOutput::SHDRMetadata{
             .desiredContentMaxLuminance      = hdr_static_metadata->desired_content_max_luminance,
             .desiredMaxFrameAverageLuminance = hdr_static_metadata->desired_content_max_frame_avg_luminance,
@@ -2019,13 +2165,13 @@ IOutput::SParsedEDID Aquamarine::SDRMConnector::parseEDID(std::vector<uint8_t> d
 
     const auto* ssc = di_info_get_supported_signal_colorimetry(info);
     if (ssc) {
-        TRACE(backend->backend->log(AQ_LOG_TRACE, std::format("EDID: found colorimetry bt2020_rgb={}", ssc->bt2020_rgb)));
+        TRACE(backend->log(AQ_LOG_TRACE, std::format("EDID: found colorimetry bt2020_rgb={}", ssc->bt2020_rgb)));
         parsed.supportsBT2020 = ssc->bt2020_rgb;
     }
 
     di_info_destroy(info);
 
-    TRACE(backend->backend->log(AQ_LOG_TRACE, "EDID: parsed"));
+    TRACE(backend->log(AQ_LOG_TRACE, "EDID: parsed"));
 
     return parsed;
 }
@@ -2038,9 +2184,9 @@ void Aquamarine::SDRMConnector::recheckCRTCProps() {
     canDoVrr           = props.values.vrr_capable && crtc->props.values.vrr_enabled && getDRMProp(backend->gpu->fd, id, props.values.vrr_capable, &prop) && prop;
     output->vrrCapable = canDoVrr;
 
-    backend->backend->log(AQ_LOG_DEBUG,
-                          std::format("drm: connector {} crtc is {} of vrr: props.vrr_capable -> {}, crtc->props.vrr_enabled -> {}", szName, (canDoVrr ? "capable" : "incapable"),
-                                      props.values.vrr_capable, crtc->props.values.vrr_enabled));
+    backend->log(AQ_LOG_DEBUG,
+                 std::format("drm: connector {} crtc is {} of vrr: props.vrr_capable -> {}, crtc->props.vrr_enabled -> {}", szName, (canDoVrr ? "capable" : "incapable"),
+                             props.values.vrr_capable, crtc->props.values.vrr_enabled));
 
     output->supportsExplicit = !tiledOwner && backend->drmProps.supportsTimelines && crtc->props.values.out_fence_ptr && crtc->primary->props.values.in_fence_fd;
     if (tiledOwner) {
@@ -2048,34 +2194,42 @@ void Aquamarine::SDRMConnector::recheckCRTCProps() {
         output->vrrCapable = false;
     }
 
-    backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Explicit sync {}", output->supportsExplicit ? "supported" : "unsupported"));
+    backend->log(AQ_LOG_DEBUG, std::format("drm: Explicit sync {}", output->supportsExplicit ? "supported" : "unsupported"));
 
-    backend->backend->log(AQ_LOG_DEBUG, std::format("drm: connector {} crtc {} CTM", szName, (crtc->props.values.ctm ? "supports" : "doesn't support")));
+    backend->log(AQ_LOG_DEBUG, std::format("drm: connector {} crtc {} CTM", szName, (crtc->props.values.ctm ? "supports" : "doesn't support")));
 
-    backend->backend->log(
-        AQ_LOG_DEBUG,
-        std::format("drm: connector {} crtc {} HDR ({})", szName, (props.values.hdr_output_metadata ? "supports" : "doesn't support"), props.values.hdr_output_metadata));
+    backend->log(AQ_LOG_DEBUG,
+                 std::format("drm: connector {} crtc {} HDR ({})", szName, (props.values.hdr_output_metadata ? "supports" : "doesn't support"), props.values.hdr_output_metadata));
 
-    backend->backend->log(AQ_LOG_DEBUG,
-                          std::format("drm: connector {} crtc {} Colorspace ({})", szName, (props.values.Colorspace ? "supports" : "doesn't support"), props.values.Colorspace));
+    backend->log(AQ_LOG_DEBUG,
+                 std::format("drm: connector {} crtc {} Colorspace ({})", szName, (props.values.Colorspace ? "supports" : "doesn't support"), props.values.Colorspace));
 }
 
 void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
     if (output) {
-        backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Not connecting connector {} because it's already connected", szName));
+        backend->log(AQ_LOG_DEBUG, std::format("drm: Not connecting connector {} because it's already connected", szName));
         return;
     }
 
     // max_bpc-less retry is per-sink and must not persist across hotplugs.
     maxBpcFailed = false;
 
-    backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Connecting connector {}, {}", szName, crtc ? std::format("CRTC ID {}", crtc->id) : "no CRTC"));
+    backend->log(AQ_LOG_DEBUG, std::format("drm: Connecting connector {}, {}", szName, crtc ? std::format("CRTC ID {}", crtc->id) : "no CRTC"));
 
     output            = SP<CDRMOutput>(new CDRMOutput(szName, backend, self.lock()));
     output->self      = output;
     output->connector = self.lock();
+    const auto weakOutput      = output->self;
+    output->frameReadyListener = sched.frameReady.listen([weakOutput] {
+        if (const auto owner = weakOutput.lock(); owner && owner->usable())
+            owner->events.frame.emit();
+    });
+    output->rescheduleListener = sched.rescheduleNeeded.listen([weakOutput] {
+        if (const auto owner = weakOutput.lock(); owner && owner->usable())
+            owner->scheduleFrame(IOutput::AQ_SCHEDULE_NEEDS_FRAME);
+    });
 
-    backend->backend->log(AQ_LOG_DEBUG, "drm: Dumping detected modes:");
+    backend->log(AQ_LOG_DEBUG, "drm: Dumping detected modes:");
 
     auto currentModeInfo = getCurrentMode();
 
@@ -2083,7 +2237,7 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
         auto& drmMode = connector->modes[i];
 
         if (drmMode.flags & DRM_MODE_FLAG_INTERLACE) {
-            backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Skipping mode {} because it's interlaced", i));
+            backend->log(AQ_LOG_DEBUG, std::format("drm: Skipping mode {} because it's interlaced", i));
             continue;
         }
 
@@ -2105,9 +2259,9 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
             // getDRMProp(backend->gpu->fd, crtc->id, crtc->props.mode_id, &modeID);
         }
 
-        backend->backend->log(AQ_LOG_DEBUG,
-                              std::format("drm: Mode {}: {}x{}@{:.2f}Hz {}", i, (int)aqMode->pixelSize.x, (int)aqMode->pixelSize.y, aqMode->refreshRate / 1000.0,
-                                          aqMode->preferred ? " (preferred)" : ""));
+        backend->log(AQ_LOG_DEBUG,
+                     std::format("drm: Mode {}: {}x{}@{:.2f}Hz {}", i, (int)aqMode->pixelSize.x, (int)aqMode->pixelSize.y, aqMode->refreshRate / 1000.0,
+                                 aqMode->preferred ? " (preferred)" : ""));
     }
 
     if (!currentModeInfo && fallbackMode)
@@ -2118,7 +2272,7 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
 
     output->physicalSize = {(double)connector->mmWidth, (double)connector->mmHeight};
 
-    backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Physical size {} (mm)", output->physicalSize));
+    backend->log(AQ_LOG_DEBUG, std::format("drm: Physical size {} (mm)", output->physicalSize));
 
     switch (connector->subpixel) {
         case DRM_MODE_SUBPIXEL_NONE: output->subpixel = eSubpixelMode::AQ_SUBPIXEL_NONE; break;
@@ -2133,14 +2287,14 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
     uint64_t prop = 0;
     if (getDRMProp(backend->gpu->fd, id, props.values.non_desktop, &prop)) {
         if (prop == 1)
-            backend->backend->log(AQ_LOG_DEBUG, "drm: Non-desktop connector");
+            backend->log(AQ_LOG_DEBUG, "drm: Non-desktop connector");
         output->nonDesktop = prop;
     }
 
     maxBpcBounds.fill(0);
 
     if (props.values.max_bpc && !introspectDRMPropRange(backend->gpu->fd, props.values.max_bpc, maxBpcBounds.data(), &maxBpcBounds[1]))
-        backend->backend->log(AQ_LOG_ERROR, "drm: Failed to check max_bpc");
+        backend->log(AQ_LOG_ERROR, "drm: Failed to check max_bpc");
 
     size_t               edidLen  = 0;
     uint8_t*             edidData = (uint8_t*)getDRMPropBlob(backend->gpu->fd, id, props.values.edid, &edidLen);
@@ -2160,7 +2314,7 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
     output->description = std::format("{} {} {} ({})", make, model, serial, szName);
     output->needsFrame  = true;
 
-    backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Description {}", output->description));
+    backend->log(AQ_LOG_DEBUG, std::format("drm: Description {}", output->description));
 
     status = DRM_MODE_CONNECTED;
 
@@ -2170,7 +2324,7 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
         return;
 
     if (!backend->updateSecondaryRendererState()) {
-        backend->backend->log(AQ_LOG_ERROR, std::format("drm: Failed to update renderer state for {} on connect", szName));
+        backend->log(AQ_LOG_ERROR, std::format("drm: Failed to update renderer state for {} on connect", szName));
         return;
     }
 
@@ -2182,50 +2336,48 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
 }
 
 void Aquamarine::SDRMConnector::disconnect() {
-    if (const auto owner = tiledOwner.lock()) {
-        if (!owner->disconnectTiled())
-            backend->log(AQ_LOG_WARNING, "drm: Deferring tiled teardown until the complete group can be disabled");
+    const auto owner = backend.lock();
+    if (!owner || owner->shuttingDown() || !output)
+        return;
+    if (const auto tiled = tiledOwner.lock()) {
+        if (!tiled->disconnectTiled())
+            owner->log(AQ_LOG_WARNING, "drm: Deferring tiled teardown until the complete group can be disabled");
         return;
     }
-    if (!output) {
-        if (backend && backend->backend)
-            backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Not disconnecting connector {} because it's already disconnected", szName));
+    owner->cancelAsyncOutput(output.get());
+    if (owner->shuttingDown() || !output)
         return;
-    }
-
-    backend->cancelAsyncOutput(output.get());
     invalidateFrame();
-
-    // normal output commits reject disconnected connectors, so disable KMS
-    // directly before releasing the output and its framebuffer references.
-    if (crtc && backend->backend->session && backend->backend->session->active && output->enabledState) {
-        const auto QUEUE_KEY = crtc->id;
-        if (backend->pauseCommitQueue(QUEUE_KEY)) {
-            CScopeGuard             resume([this, QUEUE_KEY] { backend->resumeCommitQueue(QUEUE_KEY); });
-            SDRMConnectorCommitData data = {};
-            data.modeset                 = true;
-            data.blocking                = true;
-            data.committed               = COutputState::AQ_OUTPUT_STATE_ENABLED;
-
-            if (backend->impl->commit(self.lock(), data)) {
-                output->enabledState = false;
-                backend->log(AQ_LOG_DEBUG, std::format("drm: Disabled KMS output {} before disconnect", szName));
-            } else
-                backend->log(AQ_LOG_ERROR, std::format("drm: Failed to disable KMS output {} before disconnect", szName));
-        } else
-            backend->log(AQ_LOG_ERROR, std::format("drm: Failed to pause commit queue for disconnect of {}", szName));
+    if (owner->shuttingDown() || !output)
+        return;
+    const bool hasFB = crtc && ((crtc->primary && (crtc->primary->front || crtc->primary->back)) || (crtc->cursor && (crtc->cursor->front || crtc->cursor->back)));
+    if (crtc && (hasFB || output->enabledState)) {
+        if (!owner->sessionActive() || !owner->pauseCommitQueue(crtc->id) || owner->shuttingDown() || !output || !crtc)
+            return;
+        const auto              key = crtc->id;
+        CScopeGuard             resume([owner, key] { owner->resumeCommitQueue(key); });
+        SDRMConnectorCommitData data{};
+        data.modeset   = true;
+        data.blocking  = true;
+        data.committed = COutputState::AQ_OUTPUT_STATE_ENABLED;
+        if (!owner->impl->commit(self.lock(), data)) {
+            owner->log(AQ_LOG_ERROR, "drm: Deferring disconnect after failed disable");
+            return;
+        }
     }
-
+    DRMFBList retired;
+    releaseFBReferences(&retired);
     status = DRM_MODE_DISCONNECTED;
-    releaseFBReferences();
-
-    if (output->announced)
-        output->events.destroy.emit();
-    output.reset();
+    const auto oldOutput = std::move(output);
+    oldOutput->detach();
+    for (const auto& fb : retired)
+        releaseFBBuffer(fb);
+    if (std::exchange(oldOutput->announced, false))
+        oldOutput->events.destroy.emit();
 }
 
 bool Aquamarine::SDRMConnector::commitState(SDRMConnectorCommitData& data) {
-    if (status != DRM_MODE_CONNECTED || !output)
+    if (!backend || backend->shuttingDown() || status != DRM_MODE_CONNECTED || !output)
         return false;
 
     const bool ok = backend->impl->commit(self.lock(), data);
@@ -2266,7 +2418,7 @@ void Aquamarine::SDRMConnector::applyCommit(SDRMConnectorCommitData& data) {
 
         if (crtc->primary->back != data.mainFB) {
             crtc->primary->back = data.mainFB;
-            data.mainFB->buffer->backendPin();
+            data.mainFB->pin();
         }
         crtc->primary->backSet = true;
         data.primaryFBChanged  = true;
@@ -2286,7 +2438,7 @@ void Aquamarine::SDRMConnector::applyCommit(SDRMConnectorCommitData& data) {
                 if (crtc->cursor->back != desired) {
                     crtc->cursor->back = desired;
                     if (desired)
-                        desired->buffer->backendPin();
+                        desired->pin();
                 }
 
                 crtc->cursor->backSet = true;
@@ -2308,10 +2460,10 @@ void Aquamarine::SDRMConnector::applyCommit(SDRMConnectorCommitData& data) {
     if (!output->enabledState)
         invalidateFrame();
 
-    if (!backend->updateSecondaryRendererState(&data.retiredFBs))
-        backend->backend->log(AQ_LOG_ERROR, std::format("drm: Failed to update renderer state for {} on applyCommit", szName));
+    if (backend && !backend->shuttingDown() && !backend->updateSecondaryRendererState(&data.retiredFBs))
+        backend->log(AQ_LOG_ERROR, std::format("drm: Failed to update renderer state for {} on applyCommit", szName));
 
-    if (wasEnabled != output->enabledState && !tiledOwner) {
+    if (backend && !backend->shuttingDown() && wasEnabled != output->enabledState && !tiledOwner) {
         auto bk = backend.lock();
         if (bk) {
             bk->backend->log(AQ_LOG_DEBUG, std::format("drm: Connector {} enabledState changed {} -> {}", szName, wasEnabled, output->enabledState));
@@ -2339,7 +2491,7 @@ void Aquamarine::SDRMConnector::invalidateFrame() {
 
     if (crtc && crtc->pendingFlip.connector == self) {
         const auto COMMIT_ID = crtc->pendingFlip.commitID;
-        if (backend->commitThread && COMMIT_ID)
+        if (backend && backend->commitThread && COMMIT_ID)
             backend->commitThread->releaseQueue(crtc->id, COMMIT_ID);
         crtc->disarmPageFlip();
 
@@ -2396,16 +2548,45 @@ void Aquamarine::SDRMConnector::onPresent(bool primary, bool cursor, DRMFBList* 
         releaseFBBuffer(fb);
 }
 
-Aquamarine::CDRMOutput::~CDRMOutput() {
-    if (backend)
-        backend->cancelAsyncOutput(this);
+bool Aquamarine::CDRMOutput::usable() const {
+    return !detached && connector && backend && !backend->shuttingDown();
+}
+
+void Aquamarine::CDRMOutput::quiesce() {
+    detached     = true;
+    enabledState = false;
+    needsFrame   = false;
+    frameReadyListener.reset();
+    rescheduleListener.reset();
     if (backend && backend->backend)
         backend->backend->removeIdleEvent(frameIdle);
-    connector->sched.onFrameComplete();
-    connector->sched.setFrameScheduled(false);
+}
+
+void Aquamarine::CDRMOutput::detach() {
+    quiesce();
+    for (const auto& chain : {swapchain, mgpu.swapchain, mgpu.cursorSwapchain}) {
+        if (chain)
+            chain->shutdown();
+    }
+    mgpu.swapchain.reset();
+    mgpu.cursorSwapchain.reset();
+    tiled.reset();
+    connector.reset();
+}
+
+Aquamarine::CDRMOutput::~CDRMOutput() {
+    if (usable())
+        backend->cancelAsyncOutput(this);
+    quiesce();
+    if (connector) {
+        connector->sched.onFrameComplete();
+        connector->sched.setFrameScheduled(false);
+    }
 }
 
 void Aquamarine::CDRMOutput::releaseMgpuResources() {
+    if (!usable())
+        return;
     mgpu.swapchain.reset();
     mgpu.cursorSwapchain.reset();
 
@@ -2417,6 +2598,8 @@ void Aquamarine::CDRMOutput::releaseMgpuResources() {
 }
 
 bool Aquamarine::CDRMOutput::commit() {
+    if (!usable())
+        return false;
     if (tiled)
         return commitTiled();
     if (connector->tiledOwner)
@@ -2431,11 +2614,17 @@ bool Aquamarine::CDRMOutput::commit() {
         return false;
     if (!backend->pauseCommitQueue(QUEUE_KEY))
         return false;
-    CScopeGuard resume([this, QUEUE_KEY] { backend->resumeCommitQueue(QUEUE_KEY); });
+    const auto  owner = backend.lock();
+    CScopeGuard resume([owner, QUEUE_KEY] {
+        if (owner)
+            owner->resumeCommitQueue(QUEUE_KEY);
+    });
     return commitState();
 }
 
 bool Aquamarine::CDRMOutput::test() {
+    if (!usable())
+        return false;
     if (tiled)
         return commitTiled(true);
     if (connector->tiledOwner)
@@ -2450,11 +2639,17 @@ bool Aquamarine::CDRMOutput::test() {
         return false;
     if (!backend->pauseCommitQueue(QUEUE_KEY))
         return false;
-    CScopeGuard resume([this, QUEUE_KEY] { backend->resumeCommitQueue(QUEUE_KEY); });
+    const auto  owner = backend.lock();
+    CScopeGuard resume([owner, QUEUE_KEY] {
+        if (owner)
+            owner->resumeCommitQueue(QUEUE_KEY);
+    });
     return commitState(true);
 }
 
 void Aquamarine::CDRMOutput::setCursorVisible(bool visible) {
+    if (!usable())
+        return;
     cursorVisible = visible;
     scheduleFrame(AQ_SCHEDULE_CURSOR_VISIBLE);
 }
@@ -2580,18 +2775,20 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
 }
 
 bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+    if (!usable())
+        return false;
     if (!backend->backend->session->active) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: Session inactive");
+        backend->log(AQ_LOG_ERROR, "drm: Session inactive");
         return false;
     }
 
     if (!connector->crtc) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: No CRTC attached to output");
+        backend->log(AQ_LOG_ERROR, "drm: No CRTC attached to output");
         return false;
     }
 
     if (connector->status != DRM_MODE_CONNECTED || connector->output != self.lock()) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: Cannot commit a disconnected output");
+        backend->log(AQ_LOG_ERROR, "drm: Cannot commit a disconnected output");
         return false;
     }
 
@@ -2600,13 +2797,13 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
     const uint32_t COMMITTED = STATE.committed;
 
     if (SNAPSHOT.error()) {
-        backend->backend->log(AQ_LOG_ERROR, std::format("drm: Failed to duplicate explicit input fence: {}", strerror(SNAPSHOT.error())));
+        backend->log(AQ_LOG_ERROR, std::format("drm: Failed to duplicate explicit input fence: {}", strerror(SNAPSHOT.error())));
         return false;
     }
 
     if ((COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_ENABLED) && STATE.enabled) {
         if (!STATE.mode && !STATE.customMode) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: No mode on enable commit");
+            backend->log(AQ_LOG_ERROR, "drm: No mode on enable commit");
             return false;
         }
     }
@@ -2622,33 +2819,33 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         }
 
         if (!ok) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Selected format is not supported by the primary KMS plane");
+            backend->log(AQ_LOG_ERROR, "drm: Selected format is not supported by the primary KMS plane");
             return false;
         }
     }
 
     if (STATE.enabled && STATE.drmFormat == DRM_FORMAT_INVALID) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: No format for output");
+        backend->log(AQ_LOG_ERROR, "drm: No format for output");
         return false;
     }
 
     if (STATE.adaptiveSync && !connector->canDoVrr) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: No Adaptive sync support for output");
+        backend->log(AQ_LOG_ERROR, "drm: No Adaptive sync support for output");
         return false;
     }
 
     if (STATE.presentationMode == AQ_OUTPUT_PRESENTATION_IMMEDIATE && !backend->drmProps.supportsAsyncCommit) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: No Immediate presentation support in the backend");
+        backend->log(AQ_LOG_ERROR, "drm: No Immediate presentation support in the backend");
         return false;
     }
 
     if ((COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_BUFFER) && !STATE.buffer) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: No buffer committed");
+        backend->log(AQ_LOG_ERROR, "drm: No buffer committed");
         return false;
     }
 
     if ((COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_BUFFER) && STATE.buffer->attachments.has<CDRMBufferUnimportable>()) {
-        TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Cannot commit a KMS-unimportable buffer."));
+        TRACE(backend->log(AQ_LOG_TRACE, "drm: Cannot commit a KMS-unimportable buffer."));
         return false;
     }
 
@@ -2668,22 +2865,22 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
     if (!onlyTest) {
         if (NEEDS_RECONFIG) {
             if (STATE.enabled)
-                backend->backend->log(AQ_LOG_DEBUG,
-                                      std::format("drm: Modesetting {} with {}x{}@{:.2f}Hz", name, (int)MODE->pixelSize.x, (int)MODE->pixelSize.y, MODE->refreshRate / 1000.F));
+                backend->log(AQ_LOG_DEBUG,
+                             std::format("drm: Modesetting {} with {}x{}@{:.2f}Hz", name, (int)MODE->pixelSize.x, (int)MODE->pixelSize.y, MODE->refreshRate / 1000.F));
             else
-                backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Disabling output {}", name));
+                backend->log(AQ_LOG_DEBUG, std::format("drm: Disabling output {}", name));
         }
 
         if (STATE.enabled && NEEDS_RECONFIG && connector->sched.frameInFlight()) {
             // ALLOW_MODESET resets the CRTC, so the in-flight flip is either cancelled or
             // superseded by this commit. drop it either way; whatever event still arrives no
             // longer matches the crtcs id and is discarded.
-            backend->backend->log(AQ_LOG_DEBUG, std::format("drm: page-flip on {} cancelled by modeset, clearing flip state", name));
+            backend->log(AQ_LOG_DEBUG, std::format("drm: page-flip on {} cancelled by modeset, clearing flip state", name));
             connector->invalidateFrame();
         }
 
         if (STATE.enabled && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_BUFFER) && connector->sched.frameInFlight()) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Cannot commit when a page-flip is awaiting");
+            backend->log(AQ_LOG_ERROR, "drm: Cannot commit when a page-flip is awaiting");
             return false;
         }
 
@@ -2712,7 +2909,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
     }
 
     if (STATE.buffer && STATE.enabled) {
-        TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Committed a buffer, updating state"));
+        TRACE(backend->log(AQ_LOG_TRACE, "drm: Committed a buffer, updating state"));
 
         SP<CDRMFB> drmFB;
 
@@ -2720,17 +2917,17 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
             drmFB = blittedFB;
         else if (backend->shouldBlit()) {
             if (!backend->rendererState.renderer) {
-                backend->backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for blitting, initializing");
+                backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for blitting, initializing");
                 if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
-                    backend->backend->log(AQ_LOG_ERROR, "drm: Failed to initialize renderer backend for blitting");
+                    backend->log(AQ_LOG_ERROR, "drm: Failed to initialize renderer backend for blitting");
                     return false;
                 }
             }
 
-            TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Backend requires blit, blitting"));
+            TRACE(backend->log(AQ_LOG_TRACE, "drm: Backend requires blit, blitting"));
 
             if (!mgpu.swapchain) {
-                TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: No swapchain for blit, creating"));
+                TRACE(backend->log(AQ_LOG_TRACE, "drm: No swapchain for blit, creating"));
                 mgpu.swapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
             }
 
@@ -2745,13 +2942,13 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
             if (OPTIONS.length == 0) // releaseMgpuResources() cleared the swapchain and we committed without updating it.
                 OPTIONS.length = 2;
             if (!mgpu.swapchain->reconfigure(OPTIONS)) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain failed reconfiguring");
+                backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain failed reconfiguring");
                 return false;
             }
 
             auto NEWAQBUF = mgpu.swapchain->next(nullptr);
             if (!NEWAQBUF) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain has no buffer");
+                backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain has no buffer");
                 return false;
             }
 
@@ -2761,7 +2958,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
             auto blitResult = backend->rendererState.renderer->blit(
                 STATE.buffer, NEWAQBUF, primaryRenderer, (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
             if (!blitResult.success) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but blit failed");
+                backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but blit failed");
                 return false;
             }
 
@@ -2778,12 +2975,12 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
             drmFB = CDRMFB::create(STATE.buffer, backend, nullptr); // will return attachment if present
 
         if (!drmFB) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Buffer failed to import to KMS");
+            backend->log(AQ_LOG_ERROR, "drm: Buffer failed to import to KMS");
             return false;
         }
 
         if (drmFB->dead) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: KMS buffer is dead?!");
+            backend->log(AQ_LOG_ERROR, "drm: KMS buffer is dead?!");
             return false;
         }
 
@@ -2795,9 +2992,9 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
     if (data.mainFB) {
         if (const auto params = data.mainFB->buffer->dmabuf(); params.success && params.format != STATE.drmFormat) {
             // formats mismatch. Update the state format and roll with it
-            backend->backend->log(AQ_LOG_WARNING,
-                                  std::format("drm: Formats mismatch in commit, buffer is {} but output is set to {}. Modesetting to {}", fourccToName(params.format),
-                                              fourccToName(STATE.drmFormat), fourccToName(params.format)));
+            backend->log(AQ_LOG_WARNING,
+                         std::format("drm: Formats mismatch in commit, buffer is {} but output is set to {}. Modesetting to {}", fourccToName(params.format),
+                                     fourccToName(STATE.drmFormat), fourccToName(params.format)));
             data.outputState.drmFormat = params.format;
             formatMismatch             = true;
             // TODO: reject if tearing? We will miss a frame event!
@@ -2816,7 +3013,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         // TODO: add an API to detect this and request drm_dumb linear buffers. Or do something,
         // idk
         if (data.cursorFB->dead || data.cursorFB->buffer->dmabuf().modifier == DRM_FORMAT_MOD_INVALID) {
-            TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Dropping invalid buffer for cursor plane"));
+            TRACE(backend->log(AQ_LOG_TRACE, "drm: Dropping invalid buffer for cursor plane"));
             data.cursorFB = nullptr;
         }
     }
@@ -2859,7 +3056,11 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
     if (shouldSubmitCTM(connector, STATE, data.modeset))
         data.ctm = STATE.ctm;
 
-    bool ok = connector->commitState(data);
+    const auto committedConnector = connector;
+    const auto keepAlive          = self.lock();
+    bool       ok                 = committedConnector->commitState(data);
+    if (!usable())
+        return ok;
 
     // a buffer acquired only to validate/attempt the modeset isn't consumed by the
     // consumer: rewind the swapchain so the acquire cursor stays in sync with it.
@@ -2882,6 +3083,8 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         return ok;
 
     events.commit.emit();
+    if (!usable())
+        return true;
     state->consume(SNAPSHOT);
 
     lastCommitNoBuffer = !data.mainFB;
@@ -2909,17 +3112,22 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
             .flags     = flags,
         });
 
-        connector->onPresent();
+        if (usable())
+            connector->onPresent();
     }
 
     return ok;
 }
 
 SP<IBackendImplementation> Aquamarine::CDRMOutput::getBackend() {
+    if (!usable())
+        return nullptr;
     return backend.lock();
 }
 
 bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotspot) {
+    if (!usable())
+        return false;
     if (connector->tiledOwner)
         return !buffer;
     if (!connector->crtc)
@@ -2936,24 +3144,24 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
         auto bufferType = buffer->type();
 
         if (!buffer->good()) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: bad buffer passed to setCursor");
+            backend->log(AQ_LOG_ERROR, "drm: bad buffer passed to setCursor");
             return false;
         }
 
         if ((bufferType == eBufferType::BUFFER_TYPE_SHM && !buffer->shm().success) || (bufferType == eBufferType::BUFFER_TYPE_DMABUF && !buffer->dmabuf().success)) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Invalid buffer passed to setCursor");
+            backend->log(AQ_LOG_ERROR, "drm: Invalid buffer passed to setCursor");
             return false;
         }
 
         SP<CDRMFB> fb;
 
         if (backend->primary) {
-            TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Backend requires cursor blit, blitting"));
+            TRACE(backend->log(AQ_LOG_TRACE, "drm: Backend requires cursor blit, blitting"));
 
             if (!backend->rendererState.renderer || !backend->rendererState.allocator) {
-                backend->backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for cursor blitting, initializing");
+                backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for cursor blitting, initializing");
                 if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
-                    backend->backend->log(AQ_LOG_ERROR, "drm: Failed to initialize renderer backend for cursor blitting");
+                    backend->log(AQ_LOG_ERROR, "drm: Failed to initialize renderer backend for cursor blitting");
                     return false;
                 }
             }
@@ -2961,7 +3169,7 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
             // TODO: will this not implode on drm_dumb?!
 
             if (!mgpu.cursorSwapchain) {
-                TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: No cursorSwapchain for blit, creating"));
+                TRACE(backend->log(AQ_LOG_TRACE, "drm: No cursorSwapchain for blit, creating"));
                 mgpu.cursorSwapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
             }
 
@@ -2977,13 +3185,13 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
             OPTIONS.length     = 2;
 
             if (!mgpu.cursorSwapchain->reconfigure(OPTIONS)) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu cursorSwapchain failed reconfiguring");
+                backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu cursorSwapchain failed reconfiguring");
                 return false;
             }
 
             auto NEWAQBUF = mgpu.cursorSwapchain->next(nullptr);
             if (!NEWAQBUF) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu cursorSwapchain has no buffer");
+                backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu cursorSwapchain has no buffer");
                 return false;
             }
 
@@ -2991,7 +3199,7 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
             if (backend->primary)
                 primaryRenderer = backend->primary->rendererState.renderer;
             if (!backend->rendererState.renderer->blit(buffer, NEWAQBUF, primaryRenderer).success) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but cursor blit failed");
+                backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but cursor blit failed");
                 return false;
             }
 
@@ -3000,7 +3208,7 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
             fb = CDRMFB::create(buffer, backend, nullptr);
 
         if (!fb) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Cursor buffer failed to import to KMS");
+            backend->log(AQ_LOG_ERROR, "drm: Cursor buffer failed to import to KMS");
             return false;
         }
 
@@ -3008,7 +3216,7 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
         if (cursorMailbox)
             cursorMailbox->store(cursorPos);
 
-        backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Cursor buffer imported into KMS with id {}", fb->id));
+        backend->log(AQ_LOG_DEBUG, std::format("drm: Cursor buffer imported into KMS with id {}", fb->id));
 
         connector->crtc->pendingCursor = fb;
 
@@ -3020,6 +3228,8 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
 }
 
 void Aquamarine::CDRMOutput::moveCursor(const Vector2D& coord, bool skipSchedule) {
+    if (!usable())
+        return;
     if (connector->tiledOwner)
         return;
     cursorPos = coord;
@@ -3033,9 +3243,11 @@ void Aquamarine::CDRMOutput::moveCursor(const Vector2D& coord, bool skipSchedule
 }
 
 void Aquamarine::CDRMOutput::scheduleFrame(const scheduleFrameReason reason) {
-    TRACE(backend->backend->log(AQ_LOG_TRACE,
-                                std::format("CDRMOutput::scheduleFrame: reason {}, needsFrame {}, isPageFlipPending {}, frameEventScheduled {}", (uint32_t)reason, needsFrame,
-                                            connector->sched.frameInFlight(), connector->sched.frameScheduled())));
+    if (!usable())
+        return;
+    TRACE(backend->log(AQ_LOG_TRACE,
+                       std::format("CDRMOutput::scheduleFrame: reason {}, needsFrame {}, isPageFlipPending {}, frameEventScheduled {}", (uint32_t)reason, needsFrame,
+                                   connector->sched.frameInFlight(), connector->sched.frameScheduled())));
     needsFrame = true;
 
     if (!enabledState)
@@ -3053,20 +3265,18 @@ void Aquamarine::CDRMOutput::scheduleFrame(const scheduleFrameReason reason) {
     connector->sched.setFrameScheduled(true);
 
     if (!frameIdle) {
-        frameIdle = makeShared<std::function<void(void)>>([this, self_ = self, backend_ = backend]() {
-            if (!self_)
+        frameIdle = makeShared<std::function<void(void)>>([weak = self] {
+            const auto owner = weak.lock();
+            if (!owner || !owner->usable())
                 return;
-
+            const auto connector = owner->connector;
             connector->sched.setFrameScheduled(false);
             if (connector->sched.frameInFlight() || connector->sched.frameRunning())
                 return;
-
             CFrameRunningGuard frameRunning(connector->sched);
             connector->sched.frameReady.emit();
-
-            // above frame scheduled, and then committed, remove the idle frame. the pageflip will emit the frame.
-            if (backend_ && backend_->backend && connector->sched.frameScheduled() && connector->sched.frameInFlight()) {
-                backend_->backend->removeIdleEvent(frameIdle);
+            if (owner->usable() && owner->backend->backend && connector->sched.frameScheduled() && connector->sched.frameInFlight()) {
+                owner->backend->backend->removeIdleEvent(owner->frameIdle);
                 connector->sched.setFrameScheduled(false);
             }
         });
@@ -3076,16 +3286,22 @@ void Aquamarine::CDRMOutput::scheduleFrame(const scheduleFrameReason reason) {
 }
 
 Vector2D Aquamarine::CDRMOutput::cursorPlaneSize() {
+    if (!usable())
+        return {};
     return backend->drmProps.cursorSize;
 }
 
 bool Aquamarine::CDRMOutput::hasCursorPlane() const {
+    if (!usable())
+        return false;
     if (connector->tiledOwner)
         return false;
     return connector->status == DRM_MODE_CONNECTED && connector->crtc && connector->crtc->cursor && !connector->crtc->cursor->formats.empty();
 }
 
 std::optional<std::chrono::steady_clock::time_point> Aquamarine::CDRMOutput::nextVBlank() const {
+    if (!usable())
+        return std::nullopt;
     const auto BACKEND = backend.lock();
     if (!BACKEND || !BACKEND->sessionActive() || connector->status != DRM_MODE_CONNECTED || !connector->crtc || !enabledState || connector->refresh <= 0 ||
         (lease && lease->active))
@@ -3130,6 +3346,8 @@ std::optional<std::chrono::steady_clock::time_point> Aquamarine::CDRMOutput::nex
 }
 
 uint32_t Aquamarine::CDRMOutput::commitCapabilities() const {
+    if (!usable())
+        return 0;
     if (connector->tiledOwner)
         return 0;
     if (!backend || !backend->commitThread || !backend->atomic)
@@ -3146,6 +3364,8 @@ uint32_t Aquamarine::CDRMOutput::commitCapabilities() const {
 }
 
 Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const SCommitOptions& options) {
+    if (!usable())
+        return {.error = ENODEV};
     const auto CAPABILITIES = commitCapabilities();
     if (!(CAPABILITIES & AQ_OUTPUT_COMMIT_CAPABILITY_QUEUED))
         return {.error = ENOTSUP};
@@ -3260,7 +3480,7 @@ Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const
     asyncCommitEventPending = true;
     ++backend->m_pendingAsyncCommitEvents;
     backend->backend->addIdleEvent(makeShared<std::function<void(void)>>([output = self, drmBackend = backend] {
-        if (const auto OUTPUT = output.lock(); OUTPUT && drmBackend)
+        if (const auto OUTPUT = output.lock(); OUTPUT && OUTPUT->usable() && drmBackend && !drmBackend->shuttingDown())
             drmBackend->emitAsyncCommitEvent(OUTPUT);
     }));
 
@@ -3268,6 +3488,8 @@ Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const
 }
 
 size_t Aquamarine::CDRMOutput::getGammaSize() {
+    if (!usable())
+        return 0;
     if (connector->tiledOwner)
         return 0;
     if (!backend->atomic) {
@@ -3290,6 +3512,8 @@ size_t Aquamarine::CDRMOutput::getGammaSize() {
 }
 
 size_t Aquamarine::CDRMOutput::getDeGammaSize() {
+    if (!usable())
+        return 0;
     if (connector->tiledOwner)
         return 0;
     if (!backend->atomic) {
@@ -3312,6 +3536,8 @@ size_t Aquamarine::CDRMOutput::getDeGammaSize() {
 }
 
 std::vector<SDRMFormat> Aquamarine::CDRMOutput::getRenderFormats() {
+    if (!usable())
+        return {};
     if (tiled)
         return tiled->formats;
     if (!connector->crtc || !connector->crtc->primary || connector->crtc->primary->formats.empty()) {
@@ -3322,208 +3548,166 @@ std::vector<SDRMFormat> Aquamarine::CDRMOutput::getRenderFormats() {
 }
 
 bool Aquamarine::CDRMOutput::pendingPageFlip() {
+    if (!usable())
+        return false;
     return connector->sched.frameInFlight();
 }
 
 bool Aquamarine::CDRMOutput::pendingIdleFrame() {
+    if (!usable())
+        return false;
     return connector->sched.frameScheduled();
 }
 
 int Aquamarine::CDRMOutput::getConnectorID() {
+    if (!usable())
+        return -1;
     return connector->id;
 }
 
 Aquamarine::CDRMOutput::CDRMOutput(const std::string& name_, Hyprutils::Memory::CWeakPointer<CDRMBackend> backend_, SP<SDRMConnector> connector_) :
     backend(backend_), connector(connector_) {
+    // Only announced logical outputs notify, at detach rather than destruction.
+    emitDestroyOnDestruct = false;
     name          = name_;
     asyncOwnerID  = backend->nextAsyncOwnerID();
     cursorMailbox = makeAtomicShared<CDRMCursorPositionMailbox>();
     cursorMailbox->store(cursorPos);
 
-    // The scheduler's frameReady signal drives the public events.frame on this output.
-    frameReadyListener = connector->sched.frameReady.listen([this]() { events.frame.emit(); });
 
-    // scheduled from inside a running frame, schedule it once the running frame is done.
-    rescheduleListener = connector->sched.rescheduleNeeded.listen([this]() { scheduleFrame(AQ_SCHEDULE_NEEDS_FRAME); });
 }
 
 SP<CDRMFB> Aquamarine::CDRMFB::create(SP<IBuffer> buffer_, Hyprutils::Memory::CWeakPointer<CDRMBackend> backend_, bool* isNew) {
-
-    SP<CDRMFB> fb;
-
     if (isNew)
         *isNew = true;
-
-    if (auto at = buffer_->attachments.get<CDRMBufferAttachment>()) {
-        fb = at->fb;
-        TRACE(backend_->log(AQ_LOG_TRACE, std::format("drm: CDRMFB: buffer has drmfb attachment with fb {:x}", (uintptr_t)fb.get())));
-    }
-
-    if (fb) {
-        if (isNew)
-            *isNew = false;
-        return fb;
-    }
-
-    fb = SP<CDRMFB>(new CDRMFB(buffer_, backend_));
-
-    if (!fb->id)
+    const auto owner = backend_.lock();
+    if (!owner || owner->shuttingDown() || !owner->deviceContext || !owner->deviceContext->running() || !buffer_ || buffer_->backendRetirementPending())
         return nullptr;
-
-    buffer_->attachments.add(makeShared<CDRMBufferAttachment>(fb));
-
-    return fb;
+    if (auto at = buffer_->attachments.get<CDRMBufferAttachment>(); at && at->fb) {
+        const auto fb = at->fb;
+        if (!fb->dead && !fb->dropped && fb->id && fb->deviceContext == owner->deviceContext) {
+            if (isNew)
+                *isNew = false;
+            return fb;
+        }
+        // A live attachment from another device may still own scanout pins.
+        if (!fb->dead && !fb->dropped)
+            return nullptr;
+        buffer_->attachments.removeByType<CDRMBufferAttachment>();
+    }
+    try {
+        auto fb           = SP<CDRMFB>(new CDRMFB(buffer_, backend_));
+        fb->deviceContext = owner->deviceContext;
+        fb->importState   = fb->deviceContext->registerImport(fb, buffer_);
+        if (!fb->importState)
+            return nullptr;
+        fb->import();
+        if (!fb->id)
+            return nullptr;
+        buffer_->attachments.add(makeShared<CDRMBufferAttachment>(fb));
+        return fb;
+    } catch (const std::bad_alloc&) {
+        return nullptr; // Never submit without provisioned retirement ownership.
+    }
 }
 
-Aquamarine::CDRMFB::CDRMFB(SP<IBuffer> buffer_, Hyprutils::Memory::CWeakPointer<CDRMBackend> backend_) : buffer(buffer_), backend(backend_) {
-    import();
-}
+Aquamarine::CDRMFB::CDRMFB(SP<IBuffer> buffer_, Hyprutils::Memory::CWeakPointer<CDRMBackend> backend_) : buffer(buffer_), backend(backend_) {}
 
 void Aquamarine::CDRMFB::import() {
-    auto attrs = buffer->dmabuf();
-    if (!attrs.success) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: Buffer submitted has no dmabuf or a drm handle");
+    const auto buf = buffer.lock();
+    if (dead || !buf || !backend || backend->shuttingDown() || !deviceContext || !deviceContext->running() || buf->backendRetirementPending() || !importState)
         return;
-    }
-
-    if (buffer->attachments.has<CDRMBufferUnimportable>()) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: Buffer submitted is unimportable");
+    auto attrs = buf->dmabuf();
+    if (!attrs.success || attrs.planes < 1 || attrs.planes > 4 || buf->attachments.has<CDRMBufferUnimportable>())
         return;
-    }
-
-    // TODO: check format
+    dropped       = false;
+    handlesClosed = false;
     for (int i = 0; i < attrs.planes; ++i) {
-        int ret = drmPrimeFDToHandle(backend->gpu->fd, attrs.fds.at(i), &boHandles[i]);
-        if (ret) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: drmPrimeFDToHandle failed");
-            drop();
+        if (const int error = deviceContext->ops().importHandle(deviceContext->fd(), attrs.fds.at(i), &importState->handles[i]); error) {
+            backend->log(AQ_LOG_ERROR, std::format("drm: DMA-BUF plane {} import failed: {}", i, error));
+            drop(); // Includes handles imported before ADDFB assigned an ID.
             return;
         }
-
-        TRACE(backend->backend->log(AQ_LOG_TRACE, std::format("drm: CDRMFB: plane {} has fd {}, got handle {}", i, attrs.fds.at(i), boHandles.at(i))));
     }
-
+    boHandles       = importState->handles;
     id = submitBuffer();
-
+    importState->id = id;
     if (!id) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: Failed to submit a buffer to KMS");
-        buffer->attachments.add(makeShared<CDRMBufferUnimportable>());
         drop();
         return;
     }
-
-    TRACE(backend->backend->log(AQ_LOG_TRACE, std::format("drm: new buffer {}", id)));
-
     closeHandles();
-
-    listeners.destroyBuffer = buffer->events.destroy.listen([this] {
-        drop();
-        dead      = true;
-        id        = 0;
-        boHandles = {0, 0, 0, 0};
+    const auto weak         = importState->fb;
+    listeners.destroyBuffer = buf->events.destroy.listen([weak] {
+        if (const auto fb = weak.lock()) {
+            fb->drop();
+            fb->dead = true;
+        }
     });
 }
 
 void Aquamarine::CDRMFB::reimport() {
+    if (dead || !backend || backend->shuttingDown() || !deviceContext || !deviceContext->running())
+        return;
+    // Reimporting a currently scanned-out FB would lose its kernel ownership.
+    if (importState && importState->pins)
+        return;
     drop();
-    dropped       = false;
-    handlesClosed = false;
-    boHandles     = {0, 0, 0, 0};
-
     import();
 }
 
 Aquamarine::CDRMFB::~CDRMFB() {
     drop();
 }
+void Aquamarine::CDRMFB::pin() {
+    if (deviceContext)
+        deviceContext->pin(importState);
+}
+void Aquamarine::CDRMFB::unpin() {
+    if (deviceContext)
+        deviceContext->unpin(importState);
+}
 
 void Aquamarine::CDRMFB::closeHandles() {
     if (handlesClosed)
         return;
-
     handlesClosed = true;
-
-    std::vector<uint32_t> closed;
-
-    for (size_t i = 0; i < 4; ++i) {
-        if (boHandles.at(i) == 0)
-            continue;
-
-        bool exists = false;
-        for (size_t j = 0; j < i; ++j) {
-            if (boHandles.at(i) == boHandles.at(j)) {
-                exists = true;
-                break;
-            }
-        }
-        if (exists)
-            continue;
-
-        if (drmCloseBufferHandle(backend->gpu->fd, boHandles.at(i)))
-            backend->backend->log(AQ_LOG_ERROR, "drm: drmCloseBufferHandle failed");
-    }
-
-    boHandles = {0, 0, 0, 0};
+    if (deviceContext && importState)
+        deviceContext->closeHandles(*importState);
+    boHandles = {};
 }
 
 void Aquamarine::CDRMFB::drop() {
     if (dropped)
         return;
-
     dropped = true;
+    listeners.destroyBuffer.reset();
+    if (deviceContext && importState && deviceContext->running())
+        deviceContext->dropImport(*importState);
+    id            = 0;
+    boHandles     = {};
+    handlesClosed = true;
+}
 
-    if (!id)
-        return;
-
-    closeHandles();
-
-    TRACE(backend->backend->log(AQ_LOG_TRACE, std::format("drm: dropping buffer {}", id)));
-
-    int ret = drmModeCloseFB(backend->gpu->fd, id);
-    if (ret == -EINVAL)
-        ret = drmModeRmFB(backend->gpu->fd, id);
-
-    if (ret)
-        backend->backend->log(AQ_LOG_ERROR, std::format("drm: Failed to close a buffer: {}", strerror(-ret)));
+void Aquamarine::CDRMFB::invalidate() {
+    // The device context retains the actual ID/handle ownership and pins.
+    dead          = true;
+    dropped       = true;
+    handlesClosed = true;
+    id            = 0;
+    boHandles     = {};
+    listeners.destroyBuffer.reset();
+    backend.reset();
 }
 
 uint32_t Aquamarine::CDRMFB::submitBuffer() {
-    uint32_t newID = 0;
-
-    if (!buffer->dmabuf().success)
+    if (!deviceContext || !deviceContext->running() || !backend || !buffer || !importState)
         return 0;
-
-    auto                    attrs = buffer->dmabuf();
-    std::array<uint64_t, 4> mods  = {0, 0, 0, 0};
-    for (int i = 0; i < attrs.planes; ++i) {
-        mods[i] = attrs.modifier;
+    uint32_t newID = 0;
+    if (const int error = deviceContext->ops().addFB(deviceContext->fd(), buffer->dmabuf(), importState->handles, backend->drmProps.supportsAddFb2Modifiers, &newID); error) {
+        backend->log(AQ_LOG_ERROR, std::format("drm: framebuffer creation failed: {}", error));
+        return 0;
     }
-
-    if (backend->drmProps.supportsAddFb2Modifiers && attrs.modifier != DRM_FORMAT_MOD_INVALID) {
-        TRACE(backend->backend->log(AQ_LOG_TRACE,
-                                    std::format("drm: Using drmModeAddFB2WithModifiers to import buffer into KMS: Size {} with format {} and mod 0x{:x} : {}", attrs.size,
-                                                fourccToName(attrs.format), attrs.modifier, drmModifierToName(attrs.modifier))));
-        if (drmModeAddFB2WithModifiers(backend->gpu->fd, attrs.size.x, attrs.size.y, attrs.format, boHandles.data(), attrs.strides.data(), attrs.offsets.data(), mods.data(),
-                                       &newID, DRM_MODE_FB_MODIFIERS)) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Failed to submit a buffer with drmModeAddFB2WithModifiers");
-            return 0;
-        }
-    } else {
-        if (attrs.modifier != DRM_FORMAT_MOD_INVALID && attrs.modifier != DRM_FORMAT_MOD_LINEAR) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: drmModeAddFB2WithModifiers unsupported and buffer has explicit modifiers");
-            return 0;
-        }
-
-        TRACE(backend->backend->log(AQ_LOG_TRACE,
-                                    std::format("drm: Using drmModeAddFB2 to import buffer into KMS: Size {} with format {} and mod 0x{:x} : {}", attrs.size,
-                                                fourccToName(attrs.format), attrs.modifier, drmModifierToName(attrs.modifier))));
-
-        if (drmModeAddFB2(backend->gpu->fd, attrs.size.x, attrs.size.y, attrs.format, boHandles.data(), attrs.strides.data(), attrs.offsets.data(), &newID, 0)) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Failed to submit a buffer with drmModeAddFB2");
-            return 0;
-        }
-    }
-
     return newID;
 }
 
@@ -3583,7 +3767,7 @@ SP<CDRMLease> Aquamarine::CDRMLease::create(std::vector<SP<IOutput>> outputs) {
     if (outputs.empty())
         return nullptr;
 
-    if (outputs.at(0)->getBackend()->type() != AQ_BACKEND_DRM)
+    if (!outputs.at(0) || !outputs.at(0)->getBackend() || outputs.at(0)->getBackend()->type() != AQ_BACKEND_DRM)
         return nullptr;
 
     auto backend = ((CDRMBackend*)outputs.at(0)->getBackend().get())->self.lock();
@@ -3654,12 +3838,14 @@ Aquamarine::CDRMLease::~CDRMLease() {
 void Aquamarine::CDRMLease::terminate() {
     active = false;
 
-    if (drmModeRevokeLease(backend->gpu->fd, lesseeID) < 0)
+    if (backend && !backend->shuttingDown() && drmModeRevokeLease(backend->gpu->fd, lesseeID) < 0)
         backend->log(AQ_LOG_ERROR, "drm lease: Failed to revoke lease");
 
     destroy();
 }
 
 void Aquamarine::CDRMLease::destroy() {
+    if (std::exchange(destroyed, true))
+        return;
     events.destroy.emit();
 }

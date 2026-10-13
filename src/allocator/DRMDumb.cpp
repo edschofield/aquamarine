@@ -4,6 +4,7 @@
 #include <aquamarine/allocator/Swapchain.hpp>
 #include "FormatUtils.hpp"
 #include "Shared.hpp"
+#include "../backend/drm/Retirement.hpp"
 #include <fcntl.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -18,7 +19,9 @@ using namespace Hyprutils::Memory;
 #define WP CWeakPointer
 
 Aquamarine::CDRMDumbBuffer::CDRMDumbBuffer(const SAllocatorBufferParams& params, Hyprutils::Memory::CWeakPointer<CDRMDumbAllocator> allocator_,
-                                           Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain) : allocator(allocator_) {
+                                           Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain) : allocator(allocator_.lock()) {
+    if (!allocator || allocator->drmFD() < 0 || !allocator->backend)
+        return;
     attrs.format = params.format;
 
     if (int ret = drmModeCreateDumbBuffer(allocator->drmFD(), params.size.x, params.size.y, 32, 0, &handle, &stride, &bufferLen); ret < 0) {
@@ -62,16 +65,14 @@ Aquamarine::CDRMDumbBuffer::CDRMDumbBuffer(const SAllocatorBufferParams& params,
 
 Aquamarine::CDRMDumbBuffer::~CDRMDumbBuffer() {
     events.destroy.emit();
-
-    TRACE(allocator->backend->log(AQ_LOG_TRACE, std::format("DRM Dumb: dropping buffer {}", primeFD)));
-
-    if (handle == 0)
-        return;
-
-    if (data)
+    if (data && data != MAP_FAILED)
         munmap(data, bufferLen);
-
-    drmModeDestroyDumbBuffer(allocator->drmFD(), handle);
+    if (primeFD >= 0)
+        close(primeFD);
+    // The buffer retains its allocator and its separate DRM file description.
+    // KMS import handles cannot alias this allocation handle.
+    if (handle && allocator && allocator->drmFD() >= 0)
+        drmModeDestroyDumbBuffer(allocator->drmFD(), handle);
 }
 
 eBufferCapability Aquamarine::CDRMDumbBuffer::caps() {
@@ -91,7 +92,7 @@ bool Aquamarine::CDRMDumbBuffer::isSynchronous() {
 }
 
 bool Aquamarine::CDRMDumbBuffer::good() {
-    return attrs.success && data;
+    return attrs.success && data && data != MAP_FAILED;
 }
 
 SDMABUFAttrs Aquamarine::CDRMDumbBuffer::dmabuf() {
@@ -107,10 +108,13 @@ void Aquamarine::CDRMDumbBuffer::endDataPtr() {
 }
 
 Aquamarine::CDRMDumbAllocator::~CDRMDumbAllocator() {
-    ; // nothing to do
+    if (ownsFD && drmfd >= 0)
+        close(drmfd);
 }
 
-SP<CDRMDumbAllocator> Aquamarine::CDRMDumbAllocator::create(int drmfd_, Hyprutils::Memory::CWeakPointer<CBackend> backend_) {
+SP<CDRMDumbAllocator> Aquamarine::CDRMDumbAllocator::create(int drmfd_, Hyprutils::Memory::CWeakPointer<CBackend> backend_, std::shared_ptr<CDRMDeviceContext> context) {
+    if (!backend_)
+        return nullptr;
     if (drmGetNodeTypeFromFd(drmfd_) != DRM_NODE_PRIMARY) {
         backend_->log(AQ_LOG_ERROR, "DRM Dumb: Cannot create allocator when drmfd is not the primary node");
         return nullptr;
@@ -129,6 +133,14 @@ SP<CDRMDumbAllocator> Aquamarine::CDRMDumbAllocator::create(int drmfd_, Hyprutil
 
     auto a  = SP<CDRMDumbAllocator>(new CDRMDumbAllocator(drmfd_, backend_));
     a->self = a;
+    a->deviceContext = std::move(context);
+    // PRIME imports are not reference-counted within a DRM file description.
+    // A dup would share the KMS handle namespace: importing this buffer there
+    // and closing the import could close the allocator's own dumb handle.
+    a->drmfd  = backend_->reopenDRMNode(drmfd_, false);
+    a->ownsFD = true;
+    if (a->drmfd < 0)
+        return nullptr;
 
     backend_->log(AQ_LOG_DEBUG, "DRM Dumb: created a dumb allocator");
 
@@ -136,6 +148,8 @@ SP<CDRMDumbAllocator> Aquamarine::CDRMDumbAllocator::create(int drmfd_, Hyprutil
 }
 
 SP<IBuffer> Aquamarine::CDRMDumbAllocator::acquire(const SAllocatorBufferParams& params, SP<CSwapchain> swapchain_) {
+    if (!backend || (deviceContext && !deviceContext->running()))
+        return nullptr;
     auto buf = SP<IBuffer>(new CDRMDumbBuffer(params, self, swapchain_));
     if (!buf->good())
         return nullptr;

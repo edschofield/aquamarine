@@ -5,6 +5,7 @@
 #include <hyprutils/memory/SharedPtr.hpp>
 #include "../input/Input.hpp"
 #include <vector>
+#include <memory>
 
 struct udev;
 struct udev_monitor;
@@ -16,6 +17,8 @@ struct libinput_device;
 struct libinput_tablet_tool;
 
 namespace Aquamarine {
+    class CDRMDeviceContext;
+    class CDRMShutdownTest;
     class CBackend;
     class CSession;
     class CLibinputDevice;
@@ -25,6 +28,8 @@ namespace Aquamarine {
       public:
         CSessionDevice(Hyprutils::Memory::CSharedPointer<CSession> session_, const std::string& path_);
         ~CSessionDevice();
+        int                                                      close(CSession* owner = nullptr);
+        std::weak_ptr<CDRMDeviceContext>                         drmContext;
 
         static Hyprutils::Memory::CSharedPointer<CSessionDevice> openIfKMS(Hyprutils::Memory::CSharedPointer<CSession> session_, const std::string& path_);
 
@@ -33,7 +38,7 @@ namespace Aquamarine {
 
         int                                                      fd       = -1;
         int                                                      deviceID = -1;
-        dev_t                                                    dev;
+        dev_t                                                    dev      = 0;
         std::string                                              path;
 
         enum eChangeEventType : uint32_t {
@@ -58,6 +63,12 @@ namespace Aquamarine {
 
       private:
         Hyprutils::Memory::CWeakPointer<CSession> session;
+        bool                                      closed         = false;
+        int                                       closeError     = 0;
+        CSession*                                 closingSession = nullptr;
+        friend class CSession;
+        CSessionDevice() = default;
+        friend class CDRMShutdownTest;
     };
 
     class CLibinputKeyboard : public IKeyboard {
@@ -202,6 +213,8 @@ namespace Aquamarine {
     class CSession {
       public:
         ~CSession();
+        void                                                            shutdown();
+        bool                                                            shuttingDown = false;
 
         static Hyprutils::Memory::CSharedPointer<CSession>              attempt(Hyprutils::Memory::CSharedPointer<CBackend> backend_);
 
@@ -245,6 +258,7 @@ namespace Aquamarine {
         void                                                    handleLibinputTabletToolAxis(libinput_event* e);
 
         friend class CSessionDevice;
+        friend class CDRMShutdownTest;
         friend class CLibinputDevice;
     };
 };

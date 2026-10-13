@@ -301,5 +301,9 @@ namespace Aquamarine {
             Hyprutils::Signal::CSignalT<SStateEvent>   state;
             Hyprutils::Signal::CSignalT<SCommitResult> commitResult;
         } events;
+
+      protected:
+        // Backends with an explicit output lifecycle emit destruction themselves.
+        bool emitDestroyOnDestruct = true;
     };
 }

@@ -8,7 +8,8 @@
 using namespace Aquamarine;
 
 Aquamarine::IOutput::~IOutput() {
-    events.destroy.emit();
+    if (emitDestroyOnDestruct)
+        events.destroy.emit();
 }
 
 Hyprutils::Memory::CSharedPointer<SOutputMode> Aquamarine::IOutput::preferredMode() {

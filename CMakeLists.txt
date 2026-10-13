@@ -180,6 +180,16 @@ target_link_libraries(drmTileFrame PRIVATE PkgConfig::deps aquamarine)
 add_test(NAME drmTileFrame COMMAND drmTileFrame)
 add_dependencies(tests drmTileFrame)
 
+add_executable(drmShutdown "tests/DRMShutdown.cpp")
+target_include_directories(drmShutdown PRIVATE "./src/backend/drm" "./src/include")
+target_link_libraries(drmShutdown PRIVATE PkgConfig::deps aquamarine)
+add_test(NAME drmShutdown COMMAND drmShutdown)
+add_dependencies(tests drmShutdown)
+
+# Manual KMS probe. Never run as part of CTest or the default build.
+add_executable(drmShutdownHardware EXCLUDE_FROM_ALL "tests/DRMShutdownHardware.cpp")
+target_link_libraries(drmShutdownHardware PRIVATE PkgConfig::deps aquamarine)
+
 # Installation
 install(TARGETS aquamarine)
 install(DIRECTORY "include/aquamarine" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

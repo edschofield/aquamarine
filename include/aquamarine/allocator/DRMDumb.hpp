@@ -1,8 +1,10 @@
 #pragma once
 
 #include "Allocator.hpp"
+#include <memory>
 
 namespace Aquamarine {
+    class CDRMDeviceContext;
     class CDRMDumbAllocator;
     class CBackend;
     class CSwapchain;
@@ -24,7 +26,7 @@ namespace Aquamarine {
         CDRMDumbBuffer(const SAllocatorBufferParams& params, Hyprutils::Memory::CWeakPointer<CDRMDumbAllocator> allocator_,
                        Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain);
 
-        Hyprutils::Memory::CWeakPointer<CDRMDumbAllocator> allocator;
+        Hyprutils::Memory::CSharedPointer<CDRMDumbAllocator> allocator;
 
         //
         Hyprutils::Math::Vector2D pixelSize;
@@ -42,7 +44,8 @@ namespace Aquamarine {
     class CDRMDumbAllocator : public IAllocator {
       public:
         ~CDRMDumbAllocator();
-        static Hyprutils::Memory::CSharedPointer<CDRMDumbAllocator> create(int drmfd_, Hyprutils::Memory::CWeakPointer<CBackend> backend_);
+        static Hyprutils::Memory::CSharedPointer<CDRMDumbAllocator> create(int drmfd_, Hyprutils::Memory::CWeakPointer<CBackend> backend_,
+                                                                           std::shared_ptr<CDRMDeviceContext> context = {});
 
         virtual Hyprutils::Memory::CSharedPointer<IBuffer>          acquire(const SAllocatorBufferParams& params, Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain_);
         virtual Hyprutils::Memory::CSharedPointer<CBackend>         getBackend();
@@ -54,6 +57,8 @@ namespace Aquamarine {
 
       private:
         CDRMDumbAllocator(int fd_, Hyprutils::Memory::CWeakPointer<CBackend> backend_);
+        std::shared_ptr<CDRMDeviceContext> deviceContext;
+        bool                               ownsFD = false;
 
         // a vector purely for tracking (debugging) the buffers and nothing more
         std::vector<Hyprutils::Memory::CWeakPointer<CDRMDumbBuffer>> buffers;
